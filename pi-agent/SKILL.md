@@ -126,7 +126,7 @@ The subagent's final message ends in a fixed block:
 Then the footer:
 
 ```
--- pi | deepseek-flash | recon | 11s | $0.0054 | 16 tools | /Users/wu/.claude/pi-runs/<run>
+-- pi | deepseek-flash | recon | 11s | $0.0054 | 16 tools | ~/.claude/pi-runs/<run>
 ```
 
 Read `UNFINISHED` before `RESULT` - it is where the subagent admits what it guessed.
