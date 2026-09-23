@@ -56,7 +56,8 @@ every tool name must be spelled out.
 
 ## Which model
 
-Only two, and the gap between them is enormous - roughly 30x in price and 10x in latency.
+Only two, and the gap between them is enormous - roughly 30-40x in price per token and 10x in
+latency. Prices, context sizes and timings live in `reference/models.md`.
 
 **`flash`** (`deepseek/deepseek-flash`) is the default and handles most delegation: web search,
 reading and summarising code, mechanical multi-file edits, running builds, drafting boilerplate.
@@ -65,7 +66,7 @@ Measured: 4s for a web search, 11s and half a cent for a 16-tool code recon.
 **`astra`** (`openai-codex/gpt-6-astra`) is for work where being wrong is expensive: a bug that
 survived one flash attempt, an architecture judgement, a subtle race, anything you would not
 trust yourself to one-shot. It thinks slowly - 7s minimum, minutes on real tasks - so give it
-room and expect roughly 25x the bill.
+room and expect a much larger bill.
 
 Escalate on evidence, not on vibes: run flash first, and reach for astra when its answer is
 visibly thin, wrong, or it gives up.
