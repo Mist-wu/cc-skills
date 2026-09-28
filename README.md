@@ -17,12 +17,12 @@
 
 ## 亮点
 
-- **按权限分档的子代理**：pi-agent 提供 `search`、`recon`、`test`、`edit`、`browser` 和 `free` 六个档位，每档是一份工具白名单。`pi -p` 执行任何工具都不会询问，所以白名单就是沙箱。
-- **写操作隔离**：`edit` 档只能在 `pi/*` git worktree 里运行。改动以未暂存 diff 的形式回到主工作区，不会替你提交。
-- **成本可见**：每次任务返回结果时附带花费、工具调用次数和完整对话记录，日志存在 `~/.claude/pi-runs/`。
-- **两个模型分工**：`deepseek-flash` 处理面广但简单的任务，`gpt-6-astra` 处理必须做对的任务。
-- **超时可续跑**：`gpt-6-astra` 的长任务保留会话。任务被看门狗终止后，可以带着已读过的内容继续，不用从头开始。
-- **零额外依赖**：脚本按 bash 3.2 编写，macOS 自带环境就能跑，不需要 coreutils 或 Homebrew 版 bash。
+- 按权限分档的子代理：pi-agent 提供 `search`、`recon`、`test`、`edit`、`browser` 和 `free` 六个档位，每档是一份工具白名单。`pi -p` 执行任何工具都不会询问，所以白名单就是沙箱。
+- 写操作隔离：`edit` 档只能在 `pi/*` git worktree 里运行。改动以未暂存 diff 的形式回到主工作区，不会替你提交。
+- 记录花费：每次任务返回结果时附带花费、工具调用次数和完整对话记录，日志存在 `~/.claude/pi-runs/`。
+- 两个模型：`deepseek-flash` 处理面广但简单的任务，`gpt-6-astra` 处理必须做对的任务。
+- 超时可续跑：`gpt-6-astra` 的长任务保留会话。任务被看门狗终止后，可以带着已读过的内容继续，不用从头开始。
+- 兼容 macOS 自带 bash：脚本按 bash 3.2 编写，不需要装 coreutils 或 Homebrew 版 bash。
 
 ## 工作原理
 
