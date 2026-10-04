@@ -4,7 +4,10 @@
 
 **我自己写、每天在用的 Claude Code 技能。**
 
-目前收录 pi-agent：让 Claude Code 把调研、查代码、跑测试和隔离修改交给 [pi](https://pi.dev) 子代理完成。
+目前收录两个技能：
+
+- pi-agent：让 Claude Code 把调研、查代码、跑测试和隔离修改交给 [pi](https://pi.dev) 子代理完成。
+- bvsum：总结 B站视频。下载音频，取官方字幕或本地转录，联网核实后按视频内容自由组织总结。
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-d97757)](https://claude.com/claude-code)
 [![pi](https://img.shields.io/badge/pi-subagent-2563eb)](https://pi.dev)
@@ -22,6 +25,7 @@
 - 记录花费：每次任务返回结果时附带花费、工具调用次数和完整对话记录，日志存在 `~/.claude/pi-runs/`。
 - 两个模型：`deepseek-flash` 处理面广但简单的任务，`gpt-6-astra` 处理必须做对的任务。
 - 超时可续跑：`gpt-6-astra` 的长任务保留会话。任务被看门狗终止后，可以带着已读过的内容继续，不用从头开始。
+- 会核实内容的视频总结：bvsum 读完整份字稿后，用 WebSearch 查证视频里的数字、事件和引用，并在总结里标明哪些属实、哪些有出入。总结不套固定模板。
 - 兼容 macOS 自带 bash：脚本按 bash 3.2 编写，不需要装 coreutils 或 Homebrew 版 bash。
 
 ## 工作原理
@@ -48,9 +52,11 @@ ln -s "$PWD/cc-skills/pi-agent" ~/.claude/skills/pi-agent
 
 pi-agent 依赖 `pi`、`jq` 和 `git`。运行日志默认写到 `~/.claude/pi-runs/`，worktree 写到 `~/.claude/pi-worktrees/`，可以用 `PI_RUN_DIR` 和 `PI_WT_DIR` 改位置。
 
+bvsum 依赖 Python 3、ffmpeg，以及 `uvx`（mlx-whisper）或 `whisper-cli`。音频和字稿写到 `/tmp/bvsum/<BV号>/`，重启后清空。pi 版本在 [pi-extensions](https://github.com/Mist-wu/pi-extensions) 里。
+
 ## 使用
 
-安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发。也可以手动调用脚本：
+安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发 pi-agent；发一个 B站链接说“总结一下”即可触发 bvsum。也可以手动调用脚本：
 
 ```bash
 ~/.claude/skills/pi-agent/scripts/pi-run.sh --profile recon --label auth -- "找出登录流程涉及的文件"
@@ -60,10 +66,13 @@ pi-agent 依赖 `pi`、`jq` 和 `git`。运行日志默认写到 `~/.claude/pi-r
 
 ```text
 cc-skills/
-└── pi-agent/
-    ├── SKILL.md          # Claude 每次都会读的部分
-    ├── scripts/          # pi-run.sh、pi-wt.sh
-    └── reference/        # 按需读取，不进提示词
+├── pi-agent/
+│   ├── SKILL.md          # Claude 每次都会读的部分
+│   ├── scripts/          # pi-run.sh、pi-wt.sh
+│   └── reference/        # 按需读取，不进提示词
+└── bvsum/
+    ├── SKILL.md
+    └── scripts/          # prepare.py：下载音频、取字幕或转录
 ```
 
 `SKILL.md` 要保持简短，每次加载才划算。模型列表、协议说明这类长内容放在 `reference/`，只有真正打开时才占用上下文。
