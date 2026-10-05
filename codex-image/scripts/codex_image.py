@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用本机 Codex OAuth 会话生图。
+"""用本机 Codex OAuth 会话生图，可传入图片做改图或参考。
 
 外层对话模型默认 gpt-6-luna，生图工具默认 gpt-image-2.5。
 请求身份对齐本机 Codex TUI（originator=codex-tui，CLI 0.158.0）。
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import mimetypes
 import platform
 import subprocess
 import sys
@@ -64,14 +65,40 @@ def codex_user_agent(version: str) -> str:
     return f"codex_cli_rs/{version} ({platform.system().lower()}; {platform.machine()})"
 
 
+def image_part(source: str) -> dict:
+    if source.startswith(("http://", "https://", "data:")):
+        return {"type": "input_image", "image_url": source}
+    path = Path(source).expanduser()
+    if not path.is_file():
+        raise SystemExit(f"找不到输入图片 {path}")
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        raise SystemExit(f"不是图片文件：{path}")
+    data = base64.b64encode(path.read_bytes()).decode()
+    return {"type": "input_image", "image_url": f"data:{mime};base64,{data}"}
+
+
 def build_body(
     prompt: str,
+    images: list[str],
+    action: str,
     outer_model: str,
     image_model: str,
     size: str,
     quality: str,
     session_id: str,
 ) -> dict:
+    content = [image_part(src) for src in images]
+    content.append({"type": "input_text", "text": prompt})
+    tool = {
+        "type": "image_generation",
+        "model": image_model,
+        "size": size,
+        "quality": quality,
+        "output_format": "png",
+    }
+    if action != "auto":
+        tool["action"] = action
     return {
         "model": outer_model,
         "instructions": "You are a helpful assistant.",
@@ -87,19 +114,10 @@ def build_body(
             {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
+                "content": content,
             }
         ],
-        "tools": [
-            {
-                "type": "image_generation",
-                "action": "generate",
-                "model": image_model,
-                "size": size,
-                "quality": quality,
-                "output_format": "png",
-            }
-        ],
+        "tools": [tool],
     }
 
 
@@ -175,6 +193,18 @@ def parse_response(text: str) -> tuple[str | None, dict | None, str | None]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="用本机 Codex 会话调用 gpt-image-2.5")
     parser.add_argument("prompt", help="生图提示词")
+    parser.add_argument(
+        "-i",
+        "--image",
+        action="append",
+        default=[],
+        help="输入图片（本地路径或 URL），可多次传入，用于改图或参考",
+    )
+    parser.add_argument(
+        "--action",
+        choices=["auto", "generate", "edit"],
+        help="生图工具动作；默认无输入图为 generate，有输入图为 edit",
+    )
     parser.add_argument("-o", "--output", default="codex-image.png", help="输出 PNG 路径")
     parser.add_argument("--outer-model", default=DEFAULT_OUTER_MODEL, help="外层对话模型")
     parser.add_argument("--image-model", default=DEFAULT_IMAGE_MODEL, help="生图工具模型")
@@ -187,9 +217,12 @@ def main() -> None:
     if not prompt:
         raise SystemExit("提示词不能为空")
 
+    action = args.action or ("edit" if args.image else "generate")
     session_id = str(uuid.uuid4())
     body = build_body(
         prompt,
+        args.image,
+        action,
         args.outer_model,
         args.image_model,
         args.size,
@@ -213,6 +246,8 @@ def main() -> None:
                 "http_status": status,
                 "outer_model": args.outer_model,
                 "image_model": args.image_model,
+                "action": action,
+                "input_images": len(args.image),
                 "bytes": len(image),
                 "output": str(output),
                 "usage": usage,

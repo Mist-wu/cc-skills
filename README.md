@@ -8,7 +8,7 @@
 
 - pi-agent：让 Claude Code 把调研、查代码、跑测试和隔离修改交给 [pi](https://pi.dev) 子代理完成。
 - bvsum：总结 B站视频。下载音频，取官方字幕或本地转录，必要时联网补充，按视频内容自由组织总结。
-- codex-image：借本机 pi 登录的 Codex（ChatGPT 账号）会话调用 gpt-image-2.5 生图，不需要 OpenAI API key。
+- codex-image：借本机 pi 登录的 Codex（ChatGPT 账号）会话调用 gpt-image-2.5 生图，也能传入图片改图、换风格、多图合成，不需要 OpenAI API key。
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-d97757)](https://claude.com/claude-code)
 [![pi](https://img.shields.io/badge/pi-subagent-2563eb)](https://pi.dev)
@@ -60,7 +60,7 @@ codex-image 依赖 Python 3、已登录 openai-codex 的 `pi`（账号 ID 读 `~
 
 ## 使用
 
-安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发 pi-agent；发一个 B站链接说“总结一下”即可触发 bvsum；说“生一张……的图”即可触发 codex-image。也可以手动调用脚本：
+安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发 pi-agent；发一个 B站链接说“总结一下”即可触发 bvsum；说“生一张……的图”或给出图片路径说“把这张图改成……”即可触发 codex-image。也可以手动调用脚本：
 
 ```bash
 ~/.claude/skills/pi-agent/scripts/pi-run.sh --profile recon --label auth -- "找出登录流程涉及的文件"
