@@ -4,10 +4,11 @@
 
 **我自己写、每天在用的 Claude Code 技能。**
 
-目前收录两个技能：
+目前收录三个技能：
 
 - pi-agent：让 Claude Code 把调研、查代码、跑测试和隔离修改交给 [pi](https://pi.dev) 子代理完成。
 - bvsum：总结 B站视频。下载音频，取官方字幕或本地转录，必要时联网补充，按视频内容自由组织总结。
+- codex-image：借本机 pi 登录的 Codex（ChatGPT 账号）会话调用 gpt-image-2.5 生图，不需要 OpenAI API key。
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-d97757)](https://claude.com/claude-code)
 [![pi](https://img.shields.io/badge/pi-subagent-2563eb)](https://pi.dev)
@@ -26,6 +27,7 @@
 - 两个模型：`deepseek-flash` 处理面广但简单的任务，`gpt-6-astra` 处理必须做对的任务。
 - 超时可续跑：`gpt-6-astra` 的长任务保留会话。任务被看门狗终止后，可以带着已读过的内容继续，不用从头开始。
 - B站视频总结：bvsum 读完整份字稿再动笔，必要时用 WebSearch 补充。总结不套固定模板，形式由视频内容决定。
+- 用订阅额度生图：codex-image 运行时向 `pi auth` 取 Codex 令牌，请求身份对齐本机 Codex CLI，令牌不落盘。出图后 Claude 会自己打开检查，不对就改提示词重试。
 - 兼容 macOS 自带 bash：脚本按 bash 3.2 编写，不需要装 coreutils 或 Homebrew 版 bash。
 
 ## 工作原理
@@ -54,9 +56,11 @@ pi-agent 依赖 `pi`、`jq` 和 `git`。运行日志默认写到 `~/.claude/pi-r
 
 bvsum 依赖 Python 3、ffmpeg，以及 `uvx`（mlx-whisper）或 `whisper-cli`。音频和字稿写到 `/tmp/bvsum/<BV号>/`，重启后清空。pi 版本在 [pi-extensions](https://github.com/Mist-wu/pi-extensions) 里。
 
+codex-image 依赖 Python 3、已登录 openai-codex 的 `pi`（账号 ID 读 `~/.pi/agent/auth.json`），以及 `codex` CLI（用来取版本号拼请求头）。
+
 ## 使用
 
-安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发 pi-agent；发一个 B站链接说“总结一下”即可触发 bvsum。也可以手动调用脚本：
+安装后直接对 Claude Code 说“交给 pi 查一下……”即可触发 pi-agent；发一个 B站链接说“总结一下”即可触发 bvsum；说“生一张……的图”即可触发 codex-image。也可以手动调用脚本：
 
 ```bash
 ~/.claude/skills/pi-agent/scripts/pi-run.sh --profile recon --label auth -- "找出登录流程涉及的文件"
@@ -70,9 +74,12 @@ cc-skills/
 │   ├── SKILL.md          # Claude 每次都会读的部分
 │   ├── scripts/          # pi-run.sh、pi-wt.sh
 │   └── reference/        # 按需读取，不进提示词
-└── bvsum/
+├── bvsum/
+│   ├── SKILL.md
+│   └── scripts/          # prepare.py：下载音频、取字幕或转录
+└── codex-image/
     ├── SKILL.md
-    └── scripts/          # prepare.py：下载音频、取字幕或转录
+    └── scripts/          # codex_image.py：用 Codex 会话生图
 ```
 
 `SKILL.md` 要保持简短，每次加载才划算。模型列表、协议说明这类长内容放在 `reference/`，只有真正打开时才占用上下文。
