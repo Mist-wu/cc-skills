@@ -205,7 +205,7 @@ def main() -> None:
         choices=["auto", "generate", "edit"],
         help="生图工具动作；默认无输入图为 generate，有输入图为 edit",
     )
-    parser.add_argument("-o", "--output", default="codex-image.png", help="输出 PNG 路径")
+    parser.add_argument("-o", "--output", default="image-gen.png", help="输出 PNG 路径")
     parser.add_argument("--outer-model", default=DEFAULT_OUTER_MODEL, help="外层对话模型")
     parser.add_argument("--image-model", default=DEFAULT_IMAGE_MODEL, help="生图工具模型")
     parser.add_argument("--size", default="1024x1024")

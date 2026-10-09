@@ -1,5 +1,5 @@
 ---
-name: codex-image
+name: image-gen
 description: 用本机 pi 的 Codex（ChatGPT 账号）会话调 gpt-image-2.5 生图或改图。用户要求画图、生成图片、做插画/海报/图标/配图、"生图"，或给出图片要求修改、换风格、合成时使用。
 allowed-tools: Bash, Read
 ---
@@ -9,7 +9,7 @@ allowed-tools: Bash, Read
 ## 1. 生成
 
 ```bash
-python3 ~/.claude/skills/codex-image/scripts/codex_image.py '<提示词>' -o <输出路径.png> [-i <输入图片>]... [--size 1024x1024] [--quality medium]
+python3 ~/.claude/skills/image-gen/scripts/codex_image.py '<提示词>' -o <输出路径.png> [-i <输入图片>]... [--size 1024x1024] [--quality medium]
 ```
 
 - 令牌运行时通过 `pi auth print-bearer-token --provider openai-codex` 取，账号 ID 读 `~/.pi/agent/auth.json`。不要打印或保存令牌。
