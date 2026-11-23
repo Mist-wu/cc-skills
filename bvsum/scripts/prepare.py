@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import gzip
 import html
 import json
 import re
@@ -181,7 +182,15 @@ def request_bytes(url: str, *, referer: str = "https://www.bilibili.com/", retri
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=60) as response:
-                return response.read()
+                body = response.read()
+            # B站页面即使没声明 Accept-Encoding 也可能回 gzip
+            return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 412:  # 风控：重试只会加重，交给调用方走备用路径
+                break
+            if attempt + 1 < retries:
+                time.sleep(2 ** attempt)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt + 1 < retries:
@@ -189,9 +198,9 @@ def request_bytes(url: str, *, referer: str = "https://www.bilibili.com/", retri
     raise RuntimeError(f"请求失败：{url} ({last_error})")
 
 
-def request_json(url: str, *, referer: str = "https://www.bilibili.com/") -> dict[str, Any]:
+def request_json(url: str, *, referer: str = "https://www.bilibili.com/", retries: int = 3) -> dict[str, Any]:
     try:
-        payload = json.loads(request_bytes(url, referer=referer).decode("utf-8"))
+        payload = json.loads(request_bytes(url, referer=referer, retries=retries).decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"接口未返回 JSON：{url}") from exc
     if isinstance(payload, dict) and "code" in payload and payload.get("code") != 0:
@@ -203,8 +212,31 @@ def api_url(path: str, **params: Any) -> str:
     return f"{API}{path}?{urllib.parse.urlencode(params)}"
 
 
+def fetch_info_from_page(bvid: str) -> dict[str, Any]:
+    """从视频页内嵌的 window.__INITIAL_STATE__ 取元数据，字段与 view 接口的 data 一致。"""
+    page = request_bytes(f"https://www.bilibili.com/video/{bvid}/").decode("utf-8", "replace")
+    marker = "window.__INITIAL_STATE__="
+    start = page.find(marker)
+    if start < 0:
+        raise RuntimeError("视频页里没有 __INITIAL_STATE__")
+    try:
+        state, _ = json.JSONDecoder().raw_decode(page, start + len(marker))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("视频页 __INITIAL_STATE__ 无法解析") from exc
+    data = state.get("videoData") or {}
+    if data.get("bvid") != bvid or not data.get("pages"):
+        raise RuntimeError("视频页里的 videoData 与目标 BV 不符或缺少分P")
+    return data
+
+
 def fetch_info(bvid: str) -> dict[str, Any]:
-    payload = request_json(api_url("/x/web-interface/view", bvid=bvid))
+    try:
+        payload = request_json(api_url("/x/web-interface/view", bvid=bvid), retries=1)
+    except RuntimeError as exc:
+        if "412" not in str(exc):
+            raise
+        log("视频信息接口被风控（HTTP 412），改从视频页读取元数据…")
+        return fetch_info_from_page(bvid)
     data = payload.get("data") or {}
     if not data:
         raise RuntimeError("视频元数据为空，可能不存在或需要权限")
