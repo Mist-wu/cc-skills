@@ -35,11 +35,11 @@ ln -s "$PWD/cc-skills/image-gen" ~/.claude/skills/image-gen
 
 ## 依赖
 
-pi-agent 依赖 `pi`、`jq`、`git`，以及系统自带的 `perl`（看门狗要能在脚本退出时停掉）。运行日志默认写到 `~/.claude/pi-runs/`，worktree 写到 `~/.claude/pi-worktrees/`，可以用 `PI_RUN_DIR` 和 `PI_WT_DIR` 改位置。档位、模型和 worktree 的删除规则写在 [pi-agent/SKILL.md](pi-agent/SKILL.md)。这里用到的 pi 扩展在 [pi-extensions](https://github.com/Mist-wu/pi-extensions)。
+pi-agent 依赖 `pi`、`jq`、`git`，以及系统自带的 `perl`（看门狗要能在脚本退出时停掉）。运行日志默认写到 `~/.claude/pi-runs/`，worktree 写到 `~/.claude/pi-worktrees/`，可以用 `PI_RUN_DIR` 和 `PI_WT_DIR` 改位置。模型选择和工作树操作见 [pi-agent 使用说明](pi-agent/SKILL.md)。这里用到的 pi 扩展在 [pi-extensions](https://github.com/Mist-wu/pi-extensions)。
 
-bvsum 依赖 Python 3（本机 `/usr/bin/python3` 3.9.6 跑过 `--help`、短链和字稿复用）、ffmpeg，以及 `uvx`（mlx-whisper）或 `whisper-cli`。音频和字稿写到 `/tmp/bvsum/<BV号>/`，重启后清空。Pi 里还有一份同名入口：[Pi 版 bvsum](https://github.com/Mist-wu/pi-extensions/blob/main/skills/bvsum/SKILL.md)。
+bvsum 依赖 Python 3（本机已验证 3.9.6）、ffmpeg，以及 `uvx`（mlx-whisper）或 `whisper-cli`。音频和字稿写到 `/tmp/bvsum/<BV号>/`，重启后清空。Pi 里还有一份同名入口：[Pi 版 bvsum](https://github.com/Mist-wu/pi-extensions/blob/main/skills/bvsum/SKILL.md)。
 
-image-gen 依赖 Python 3、已登录 openai-codex 的 `pi`（账号 ID 读 `~/.pi/agent/auth.json`），以及 `codex` CLI（用来取版本号拼请求头）。版本号解析失败时脚本会停，不会改用旧版本号。
+image-gen 依赖 Python 3、已登录 openai-codex 的 `pi`（账号 ID 读 `~/.pi/agent/auth.json`），以及 `codex` CLI（用来取版本号拼请求头）。
 
 ## 使用
 
@@ -48,24 +48,6 @@ image-gen 依赖 Python 3、已登录 openai-codex 的 `pi`（账号 ID 读 `~/.
 ```bash
 ~/.claude/skills/pi-agent/scripts/pi-run.sh --profile recon --label auth -- "找出登录流程涉及的文件"
 ```
-
-## 项目结构
-
-```text
-cc-skills/
-├── pi-agent/
-│   ├── SKILL.md          # Claude 每次都会读的部分
-│   ├── scripts/          # pi-run.sh、pi-wt.sh
-│   └── reference/        # 按需读取，不进提示词
-├── bvsum/
-│   ├── SKILL.md
-│   └── scripts/          # prepare.py：下载音频、取字幕或转录
-└── image-gen/
-    ├── SKILL.md
-    └── scripts/          # codex_image.py：用 Codex 会话生图
-```
-
-`SKILL.md` 要保持简短，每次加载才划算。模型列表、协议说明这类长内容放在 `reference/`，只有真正打开时才占用上下文。
 
 ## License
 

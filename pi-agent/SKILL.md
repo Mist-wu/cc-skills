@@ -17,7 +17,7 @@ Always call them by that absolute path. The skill works in any project, and `$PW
 task at hand, never to the skill.
 
 > **In `pi -p` there is no approval prompt.** Every tool the subagent holds, it will use without
-> asking. The tool whitelist in each profile *is* the sandbox. Never widen it casually.
+> asking. Profiles limit available tool names. A profile with `bash` can still write files.
 
 ## Dispatch
 
@@ -48,38 +48,28 @@ Exit codes: `0` ok, `1` pi failed, `2` bad usage, `124` timed out.
 | `recon` | `read,grep,find,ls` | off | no |
 | `test` | `bash,read,grep,find,ls` | on | no edit tool, on purpose |
 | `edit` | `read,write,edit,bash,grep,find,ls` | on | yes, worktree only |
-| `browser` | 14 core `chrome_devtools_*` names, `web_search`, `read` | on | drives real Chrome |
+| `browser` | core `chrome_devtools_*` names, `web_search`, `read` | on | drives real Chrome |
 | `free` | whatever `--tools` says | off | depends |
 
-`pi`'s `grep`, `find` and `ls` are off unless whitelisted. `-t` takes exact names and `*`
-patterns. The browser profile still spells out the core `chrome_devtools_*` names so it
-does not also enable `chrome_devtools_webmcp_*`: `webmcp_call_tool` does not run under `pi -p`.
+`-t` accepts exact tool names and `*` patterns. Pi ignores unknown names. Install
+`websearch` for `search` and both `websearch` and `chrome-devtools` for `browser`.
+The browser profile lists the core Chrome tools individually to exclude WebMCP tools,
+which cannot run under `pi -p`.
 
 ## Which model
 
-Prices, context sizes, and the thinking-level map live in `reference/models.md`.
+Use `flash` (`deepseek/deepseek-flash`) for routine searches, code reading, builds and
+mechanical edits. Use `astra` (`openai-codex/gpt-6-astra`) for architectural decisions,
+subtle races, or a task flash could not resolve. Pass a full `provider/model` to use another
+installed model. Check the local catalog with `pi --list-models`.
 
-**`flash`** (`deepseek/deepseek-flash`) is the default and handles most delegation: web search,
-reading and summarising code, mechanical multi-file edits, running builds, drafting boilerplate.
-
-**`astra`** (`openai-codex/gpt-6-astra`) is for work where being wrong is expensive: a bug that
-survived one flash attempt, an architecture judgement, a subtle race, anything you would not
-trust yourself to one-shot. It thinks slowly, so give it room and expect a much larger bill.
-
-Escalate on evidence, not on vibes: run flash first, and reach for astra when its answer is
-visibly thin, wrong, or it gives up.
-
-## Long astra runs
-
-astra will run past a default timeout on a real task. Two habits:
+## Long runs
 
 - Raise `--timeout` deliberately (1800-3000s for anything meaty). The budget is written into
   the subagent's prompt, so it knows to wrap up rather than get killed mid-thought.
 - Keep the session (default for `test`/`edit`/`browser`; pass `--session new` for `recon`).
-  A killed run is resumable: the footer prints a `resume:` command with the script path,
-  profile, model, cwd, timeout, thinking, session, and `--tools` when the profile needs them.
-  Paths are shell-quoted. Run that command as-is. **A resume replays the whole context, so on
-  astra it costs real money** - resuming is for salvaging work, not for chatting.
+  The footer prints a shell-quoted `resume:` command with the supplied options, working
+  directory, timeout and session ID. Resuming replays the session context.
 - Exit `124` means the watchdog fired: it sent `TERM` to the pi process group, then `KILL`
   after 10 seconds if the group was still alive. An external `TERM`, or you interrupting the
   wrapper, is not reported as a timeout. The wrapper reaps that process group before it returns.

@@ -4,7 +4,6 @@
 外层对话模型默认 gpt-6-luna，生图工具默认 gpt-image-2.5。
 请求身份对齐本机 Codex TUI（originator=codex-tui）。
 版本号读 `codex --version`。解析失败就停止，不用旧版本号冒充。
-旧的 codex_cli_rs/0.125.0 会被 ChatGPT 账号拒绝 gpt-6-luna。
 访问令牌运行时向 pi 读取，不写入本文件。
 """
 
@@ -216,9 +215,7 @@ def parse_response(text: str) -> tuple[str | None, dict | None, str | None]:
     error = None
     for event in iter_sse(text):
         kind = event.get("type")
-        failure = _event_error(event)
-        if failure and error is None:
-            error = failure
+        error = error or _event_error(event)
         if kind == "response.output_item.done":
             image_b64 = take_image(event.get("item") or {}, image_b64)
         if kind == "response.completed":
@@ -226,13 +223,9 @@ def parse_response(text: str) -> tuple[str | None, dict | None, str | None]:
             usage = response.get("usage") or usage
             for item in response.get("output") or []:
                 image_b64 = take_image(item, image_b64)
-            if not image_b64:
-                incomplete = _event_error({"type": "response.incomplete", "response": response})
-                status = str(response.get("status") or "")
-                if status == "incomplete" and error is None and incomplete:
-                    error = incomplete
-                elif status == "failed" and error is None:
-                    error = _event_error({"type": "response.failed", "response": response})
+            status = response.get("status")
+            if not image_b64 and not error and status in ("failed", "incomplete"):
+                error = _event_error({"type": f"response.{status}", "response": response})
     return image_b64, usage, error
 
 

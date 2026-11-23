@@ -40,7 +40,7 @@ if [ "${1:-}" = "progress" ]; then
   printf 'run: %s\n' "$DIR"
   [ -f "$DIR/cmd.txt" ] && sed -n '1,2p' "$DIR/cmd.txt"
   if [ -f "$DIR/raw.jsonl" ]; then
-    printf 'elapsed: %ss\n' "$(( $(date +%s) - $(stat -f %B "$DIR/raw.jsonl" 2>/dev/null || echo "$(date +%s)") ))"
+    printf 'elapsed: %ss\n' "$(( $(date +%s) - $(stat -f %B "$DIR/raw.jsonl" 2>/dev/null || date +%s) ))"
     printf 'steps:\n'
     jq -Rrn '[inputs | select(startswith("{")) | (fromjson? // empty)]
             | .[] | select(.type=="tool_execution_start" or .type=="tool_execution_end")
@@ -57,41 +57,45 @@ if [ "${1:-}" = "progress" ]; then
 fi
 
 # -------------------------------------------------------------------- args ---
-PROFILE=recon MODEL=flash CWD=$PWD TIMEOUT= TIMEOUT_SET=0 SESSION= THINKING=high
-EXTRA_TOOLS= LABEL= PROMPT= DRY_RUN=0 UNSAFE=0
+PROFILE=recon MODEL=flash CWD=$PWD TIMEOUT='' SESSION='' THINKING=high
+EXTRA_TOOLS='' LABEL='' PROMPT='' DRY_RUN=0 UNSAFE=0
 
+# Preserve the supplied wrapper options for resume. Pin cwd, timeout and session
+# after resolving their defaults and turning "new" into the actual session ID.
+case "$0" in /*) RESUME=("$0") ;; *) RESUME=("$PWD/$0") ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
-    --profile)        [ $# -ge 2 ] || die "--profile needs a value"; PROFILE=$2; shift 2 ;;
-    --model)          [ $# -ge 2 ] || die "--model needs a value"; MODEL=$2; shift 2 ;;
-    --cwd)            [ $# -ge 2 ] || die "--cwd needs a value"; CWD=$2; shift 2 ;;
-    --timeout)
-      [ $# -ge 2 ] || die "--timeout needs a value"
-      [ -n "$2" ] || die "--timeout needs a non-empty integer"
-      TIMEOUT=$2
-      TIMEOUT_SET=1
-      shift 2
-      ;;
-    --session)        [ $# -ge 2 ] || die "--session needs a value"; SESSION=$2; shift 2 ;;
-    --thinking)       [ $# -ge 2 ] || die "--thinking needs a value"; THINKING=$2; shift 2 ;;
-    --tools)          [ $# -ge 2 ] || die "--tools needs a value"; EXTRA_TOOLS=$2; shift 2 ;;
-    --label)          [ $# -ge 2 ] || die "--label needs a value"; LABEL=$2; shift 2 ;;
-    --unsafe-in-place) UNSAFE=1; shift ;;
-    --dry-run)        DRY_RUN=1; shift ;;
-    -h|--help)        usage; exit 0 ;;
-    --)               shift; PROMPT=$*; break ;;
-    *)                die "unknown option: $1 (the prompt goes after --)" ;;
+    --unsafe-in-place) UNSAFE=1; RESUME+=("$1"); shift; continue ;;
+    --dry-run) DRY_RUN=1; shift; continue ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; PROMPT=$*; break ;;
   esac
+  [ $# -ge 2 ] || die "$1 needs a value"
+  case "$1" in
+    --cwd)     CWD=$2; shift 2; continue ;;
+    --session) SESSION=$2; shift 2; continue ;;
+    --timeout) [ -n "$2" ] || die "--timeout needs a non-empty integer"
+               TIMEOUT=$2; shift 2; continue ;;
+    --profile) PROFILE=$2 ;;
+    --model) MODEL=$2 ;;
+    --thinking) THINKING=$2 ;;
+    --tools) EXTRA_TOOLS=$2 ;;
+    --label) LABEL=$2 ;;
+    *) die "unknown option: $1 (the prompt goes after --)" ;;
+  esac
+  RESUME+=("$1" "$2")
+  shift 2
 done
 
 [ -n "$PROMPT" ] || { usage >&2; die "no prompt (put it after --)"; }
 [ -d "$CWD" ] || die "--cwd is not a directory: $CWD"
+case "$CWD" in /*) ;; *) CWD=$PWD/$CWD ;; esac
 if [ -n "$LABEL" ]; then
   case "$LABEL" in
     *[!A-Za-z0-9._-]*) die "--label may only contain letters, digits, dot, dash, underscore" ;;
   esac
 fi
-if [ "$TIMEOUT_SET" -eq 1 ]; then
+if [ -n "$TIMEOUT" ]; then
   case "$TIMEOUT" in
     *[!0-9]*) die "--timeout must be a positive integer" ;;
   esac
@@ -109,9 +113,6 @@ case "$MODEL" in
   */*)   PROVIDER=${MODEL%%/*} MODEL_ID=${MODEL#*/}    MODEL_TIMEOUT=600  ;;
   *)     die "unknown model: $MODEL (use flash, astra, or provider/model)" ;;
 esac
-
-# Saved before `free` clears EXTRA_TOOLS. Resume must pass this list back.
-REQUESTED_TOOLS=$EXTRA_TOOLS
 
 # ----------------------------------------------------------------- profile ---
 CHROME_TOOLS='chrome_devtools_load,chrome_devtools_list_pages,chrome_devtools_select_page,chrome_devtools_navigate,chrome_devtools_evaluate,chrome_devtools_screenshot,chrome_devtools_snapshot,chrome_devtools_click,chrome_devtools_fill,chrome_devtools_press,chrome_devtools_wait_for,chrome_devtools_console,chrome_devtools_network,chrome_devtools_emulate,chrome_devtools_cdp_send'
@@ -314,15 +315,13 @@ STATS=$(jq -Rrn '
   | ($e | map(select(.type=="message_end" and .message.role=="assistant"))) as $am
   | {
       cost:   ([$am[] | .message.usage.cost.total // 0] | add // 0),
-      tin:    ([$am[] | .message.usage.input      // 0] | add // 0),
-      tout:   ([$am[] | .message.usage.output     // 0] | add // 0),
       tools:  ([$e[]  | select(.type=="tool_execution_end")] | length),
       terr:   ([$e[]  | select(.type=="tool_execution_end" and .isError==true)] | length),
       stop:   ($am | last | .message.stopReason // "none"),
       recent: ([$e[]  | select(.type=="tool_execution_end") | .toolName] | .[-3:] | join(" ")),
       think:  ([$am[] | .message.content[]? | select(.type=="thinking") | .thinking] | last // "")
     }' "$RAW" 2>/dev/null)
-[ -n "$STATS" ] || STATS='{"cost":0,"tin":0,"tout":0,"tools":0,"terr":0,"stop":"none","recent":"","think":""}'
+[ -n "$STATS" ] || STATS='{"cost":0,"tools":0,"terr":0,"stop":"none","recent":"","think":""}'
 stat_of() { printf '%s' "$STATS" | jq -r ".$1 // empty"; }
 
 FINAL=$(jq -Rrn '
@@ -348,20 +347,10 @@ printf '\n-- pi | %s | %s | %ss | %s | %s | %s\n' \
 printf '   cost sums assistant usage.cost.total in this run log; it is not an account bill\n'
 
 if [ -n "$SID" ]; then
-  RESUME=("$0" --profile "$PROFILE" --model "$MODEL" --cwd "$CWD" --timeout "$TIMEOUT" --thinking "$THINKING")
-  if [ "$PROFILE" = free ]; then
-    RESUME+=(--tools "$TOOLS")
-  elif [ -n "$REQUESTED_TOOLS" ]; then
-    RESUME+=(--tools "$REQUESTED_TOOLS")
-  fi
-  [ "$UNSAFE" -eq 1 ] && RESUME+=(--unsafe-in-place)
-  [ -n "$LABEL" ] && RESUME+=(--label "$LABEL")
-  RESUME+=(--session "$SID" -- "...")
+  RESUME+=(--cwd "$CWD" --timeout "$TIMEOUT" --session "$SID" -- "...")
   printf '   session %s -- follow up:\n' "$SID"
   printf '   resume:'
-  for arg in "${RESUME[@]}"; do
-    printf ' %q' "$arg"
-  done
+  printf ' %q' "${RESUME[@]}"
   printf '\n'
 fi
 

@@ -14,9 +14,7 @@ python3 ~/.claude/skills/bvsum/scripts/prepare.py '<B站链接或BV号>'
 
 脚本下载音频（m4a），优先取 B 站官方字幕，没有字幕就用本地 Whisper 转录。裸 BV 号和 `b23.tv` 短链可以直接传。短链只跟随仍在 B 站域名上的跳转，再从 `/video/<BV>` 路径或页面的 canonical / og:url 取 BV。页面里靠前的推荐视频不会被当成目标。所有文件放在 `/tmp/bvsum/<BV号>/`，重启后自动清空。最后一行输出 `.bvsum.json` manifest 路径，里面有 `pubdate`、简介，每个分 P 有 `transcript_path`、`srt_path`、`audio_path`、`source`、`chapters`。
 
-已有机器字稿按 BV、分 P、cid 和旁边的 `.transcript.json` 对上来源。语言和 backend 沿用当时的记录。旧缓存没有这些记录时写成 `unknown`，不会改成这次的 `--language`。cid 变了就不复用，也不覆盖，除非加 `--force`。`--metadata-only` 只补元数据，不改已有字稿的来源。
-
-本机 `/usr/bin/python3` 3.9.6 跑过 `--help`、短链和这份缓存逻辑。脚本用了 `from __future__ import annotations` 和 `Path.unlink(missing_ok=True)`（3.8 起就有）。
+只有新转录才使用本次的 `--language` 和 `--backend`。复用机器字稿时按 BV、分 P 和 cid 匹配旁边的 `.transcript.json` 或旧清单，缺少可靠来源的字段记为 `unknown`。cid 冲突时须加 `--force` 才能重转。`--metadata-only` 保留匹配分 P 已记录的字稿来源。
 
 把字稿完整读完再动笔。长视频转录要几分钟，用 `run_in_background` 跑，等完成通知。
 

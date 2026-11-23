@@ -13,7 +13,6 @@ import argparse
 import fcntl
 import html
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -432,32 +431,6 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def write_transcript_sidecar(
-    prefix: Path,
-    *,
-    bvid: str,
-    page: int,
-    cid: int,
-    language: str,
-    backend: str,
-    source: str,
-    transcript: Path,
-) -> None:
-    payload = {
-        "bvid": bvid,
-        "page": page,
-        "cid": cid,
-        "language": language or "unknown",
-        "backend": backend or "unknown",
-        "source": source,
-        "transcript_path": str(transcript),
-    }
-    sidecar_path(prefix).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
 def manifest_page(
     manifest: dict[str, Any] | None,
     bvid: str,
@@ -475,38 +448,29 @@ def manifest_page(
     return None
 
 
-def classify_reuse(
+def cached_transcript_fields(
     prefix: Path,
     *,
     bvid: str,
     page: int,
     cid: int,
-    force: bool,
     old_manifest: dict[str, Any] | None,
-) -> tuple[str, dict[str, Any]]:
-    """Decide whether an existing TXT belongs to this BV, part, and cid.
-
-    Returns ``("reuse", fields)``, ``("transcribe", {})``, or ``("conflict", {"error": ...})``.
-    Language and backend come from the sidecar or the old manifest. They are
-    ``unknown`` when that evidence is missing. The caller's ``--language`` is not used.
-    A different cid is not reused and is not overwritten unless ``force`` is set.
-    """
-    if force:
-        return "transcribe", {}
+) -> dict[str, Any] | None:
+    """Read the existing machine transcript's provenance before reusing its files."""
     transcript = existing_transcript(prefix)
     if transcript is None:
-        return "transcribe", {}
+        return None
 
     side = read_json_file(sidecar_path(prefix)) or {}
     side_bvid = str(side.get("bvid") or "")
     side_page = _as_int(side.get("page"))
     side_cid = _as_int(side.get("cid"))
     if side_bvid and side_bvid != bvid:
-        return "conflict", {"error": f"已有字稿属于 {side_bvid}，与当前 {bvid} 不同；未覆盖。要重转请加 --force"}
+        raise RuntimeError(f"已有字稿属于 {side_bvid}，与当前 {bvid} 不同；未覆盖。要重转请加 --force")
     if side_page is not None and side_page != page:
-        return "conflict", {"error": f"已有字稿属于 P{side_page}，与当前 P{page} 不同；未覆盖。要重转请加 --force"}
+        raise RuntimeError(f"已有字稿属于 P{side_page}，与当前 P{page} 不同；未覆盖。要重转请加 --force")
     if side_cid is not None and side_cid != cid:
-        return "conflict", {"error": f"已有字稿的 cid 是 {side_cid}，当前 cid 是 {cid}；未复用也未覆盖。要重转请加 --force"}
+        raise RuntimeError(f"已有字稿的 cid 是 {side_cid}，当前 cid 是 {cid}；未复用也未覆盖。要重转请加 --force")
 
     if old_manifest and old_manifest.get("bvid") == bvid and side_cid is None:
         for item in old_manifest.get("pages") or []:
@@ -514,11 +478,16 @@ def classify_reuse(
                 continue
             old_cid = _as_int(item.get("cid"))
             if old_cid is not None and old_cid != cid:
-                return "conflict", {"error": f"清单里 P{page} 的 cid 是 {old_cid}，当前是 {cid}；未复用。要重转请加 --force"}
+                raise RuntimeError(f"清单里 P{page} 的 cid 是 {old_cid}，当前是 {cid}；未复用。要重转请加 --force")
 
-    matched = manifest_page(old_manifest, bvid, page, cid)
-    language = str(side.get("language") or (matched or {}).get("language") or "").strip() or "unknown"
-    backend = str(side.get("backend") or (matched or {}).get("backend") or "").strip() or "unknown"
+    matched = manifest_page(old_manifest, bvid, page, cid) or {}
+    # Older reuse records copied the request language and had no backend.
+    if matched.get("source") == "official-subtitle" or (
+        matched.get("source") == "existing-machine-transcript" and "backend" not in matched
+    ):
+        matched = {}
+    language = str(side.get("language") or matched.get("language") or "").strip() or "unknown"
+    backend = str(side.get("backend") or matched.get("backend") or "").strip() or "unknown"
     srt = prefix.with_suffix(".srt")
     info: dict[str, Any] = {
         "source": "existing-machine-transcript",
@@ -530,7 +499,7 @@ def classify_reuse(
     audio = prefix.with_suffix(".m4a")
     if audio.exists():
         info["audio_path"] = str(audio)
-    return "reuse", info
+    return info
 
 
 def transcribe(wav: Path, prefix: Path, language: str, backend_request: str) -> str:
@@ -609,40 +578,30 @@ def main() -> int:
             log(f"{manifest['title']} | UP主：{manifest['owner']} | {manifest['duration_seconds']} 秒")
             old_manifest = read_json_file(manifest_path)
 
-            if args.metadata_only:
-                for page in pages:
-                    page_number = int(page.get("page") or 1)
-                    cid = int(page.get("cid") or 0)
-                    entry = {
-                        "page": page_number, "cid": cid,
-                        "title": page.get("part", ""), "duration_seconds": page.get("duration", 0),
-                    }
-                    previous = manifest_page(old_manifest, bvid, page_number, cid)
-                    if previous:
-                        for key in (
-                            "source", "language", "backend", "transcript_path",
-                            "srt_path", "audio_path", "audio_duration_seconds",
-                        ):
-                            if previous.get(key) not in (None, ""):
-                                entry[key] = previous[key]
-                    manifest["pages"].append(entry)
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                print(manifest_path)
-                return 0
-
             for page_index, page in enumerate(pages, 1):
                 page_number = int(page.get("page") or page_index)
                 cid = int(page.get("cid") or 0)
-                if not cid:
-                    raise RuntimeError(f"P{page_number} 缺少 cid")
-                prefix_name = bvid if len(all_pages) == 1 else f"{bvid}_p{page_number:02d}"
-                prefix = output_dir / prefix_name
                 page_result: dict[str, Any] = {
                     "page": page_number,
                     "cid": cid,
                     "title": page.get("part", ""),
                     "duration_seconds": page.get("duration", 0),
                 }
+                manifest["pages"].append(page_result)
+                if args.metadata_only:
+                    previous = manifest_page(old_manifest, bvid, page_number, cid) or {}
+                    for key in (
+                        "source", "language", "backend", "transcript_path",
+                        "srt_path", "audio_path", "audio_duration_seconds",
+                    ):
+                        if previous.get(key) not in (None, ""):
+                            page_result[key] = previous[key]
+                    continue
+
+                if not cid:
+                    raise RuntimeError(f"P{page_number} 缺少 cid")
+                prefix_name = bvid if len(all_pages) == 1 else f"{bvid}_p{page_number:02d}"
+                prefix = output_dir / prefix_name
                 log(f"处理 P{page_number}：{page_result['title']}")
 
                 player = fetch_player(bvid, cid)
@@ -666,74 +625,45 @@ def main() -> int:
                                 page_result["audio_duration_seconds"] = round(duration, 3)
                             except Exception as exc:
                                 log(f"音频下载失败（字幕已就绪，继续）：{exc}")
-                        manifest["pages"].append(page_result)
                         continue
                     except Exception as exc:
                         log(f"官方字幕不可下载，回退本地转录：{exc}")
 
-                action, reuse_info = classify_reuse(
-                    prefix,
-                    bvid=bvid,
-                    page=page_number,
-                    cid=cid,
-                    force=args.force,
-                    old_manifest=old_manifest,
+                cached = None if args.force else cached_transcript_fields(
+                    prefix, bvid=bvid, page=page_number, cid=cid, old_manifest=old_manifest,
                 )
-                if action == "conflict":
-                    raise RuntimeError(str(reuse_info.get("error") or "已有字稿与当前分 P 不符"))
-                if action == "reuse":
-                    page_result.update(reuse_info)
-                    transcript = Path(str(reuse_info["transcript_path"]))
-                    write_transcript_sidecar(
-                        prefix,
-                        bvid=bvid,
-                        page=page_number,
-                        cid=cid,
-                        language=str(reuse_info.get("language") or "unknown"),
-                        backend=str(reuse_info.get("backend") or "unknown"),
-                        source="existing-machine-transcript",
-                        transcript=transcript,
-                    )
-                    log(
-                        "复用已有机器字稿：%s（language=%s, backend=%s）"
-                        % (transcript, reuse_info.get("language"), reuse_info.get("backend"))
-                    )
-                    manifest["pages"].append(page_result)
-                    continue
+                if cached:
+                    page_result.update(cached)
+                    log(f"复用已有机器字稿：{cached['transcript_path']}"
+                        f"（language={cached['language']}, backend={cached['backend']}）")
+                else:
+                    audio_path, duration = save_audio(bvid, cid, page, page_number, prefix)
+                    page_result["audio_path"] = str(audio_path)
+                    page_result["audio_duration_seconds"] = round(duration, 3)
+                    with tempfile.TemporaryDirectory(prefix=f"bvsum-{bvid}-p{page_number}-") as temp:
+                        wav_audio = Path(temp) / "audio.wav"
+                        convert_to_wav(audio_path, wav_audio)
+                        used_backend = transcribe(wav_audio, prefix, args.language, args.backend)
 
-                audio_path, duration = save_audio(bvid, cid, page, page_number, prefix)
-                page_result["audio_path"] = str(audio_path)
-                page_result["audio_duration_seconds"] = round(duration, 3)
-                with tempfile.TemporaryDirectory(prefix=f"bvsum-{bvid}-p{page_number}-") as temp:
-                    wav_audio = Path(temp) / "audio.wav"
-                    convert_to_wav(audio_path, wav_audio)
-                    used_backend = transcribe(wav_audio, prefix, args.language, args.backend)
-
-                transcript_path = existing_transcript(prefix)
-                if not transcript_path:
-                    raise RuntimeError("转录进程结束但未生成 TXT")
-                page_result.update({
-                    "source": "machine-transcript",
-                    "backend": used_backend,
-                    "language": args.language,
-                    "transcript_path": str(transcript_path),
-                    "srt_path": str(prefix.with_suffix('.srt')) if prefix.with_suffix('.srt').exists() else None,
-                })
-                write_transcript_sidecar(
-                    prefix,
-                    bvid=bvid,
-                    page=page_number,
-                    cid=cid,
-                    language=args.language,
-                    backend=used_backend,
-                    source="machine-transcript",
-                    transcript=transcript_path,
-                )
-                manifest["pages"].append(page_result)
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    transcript_path = existing_transcript(prefix)
+                    if not transcript_path:
+                        raise RuntimeError("转录进程结束但未生成 TXT")
+                    page_result.update({
+                        "source": "machine-transcript",
+                        "backend": used_backend,
+                        "language": args.language,
+                        "transcript_path": str(transcript_path),
+                        "srt_path": str(prefix.with_suffix('.srt')) if prefix.with_suffix('.srt').exists() else None,
+                    })
+                keys = ("page", "cid", "language", "backend", "source", "transcript_path")
+                sidecar = {"bvid": bvid, **{key: page_result[key] for key in keys}}
+                sidecar_path(prefix).write_text(json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                if not cached and page_index < len(pages):
+                    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            log(f"音频与字稿保存在 {output_dir}（重启后自动清空）")
+            if not args.metadata_only:
+                log(f"音频与字稿保存在 {output_dir}（重启后自动清空）")
             print(manifest_path)
             return 0
         except Exception as exc:

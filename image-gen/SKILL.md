@@ -38,7 +38,7 @@ python3 ~/.claude/skills/image-gen/scripts/codex_image.py '<提示词>' -o <输�
 脚本退出时会带上上游的失败类别。把这一行原样告诉用户。不要把“没有图片”理解成内容被拒，也不要据此默认改提示词。
 
 - `pi auth 失败` / 401：Codex 登录过期，让用户在终端运行 `pi` 重新登录 openai-codex。
-- 上游 HTTP 4xx 提到模型不可用：把原始报错告诉用户，可以用 `--outer-model` / `--image-model` 换模型再试。请求头用本机 `codex --version`。解析不出版本号时脚本会停，不会改用 `0.158.0`。
+- 上游 HTTP 4xx 提到模型不可用：把原始报错告诉用户，可以用 `--outer-model` / `--image-model` 换模型再试。请求头用本机 `codex --version`。解析不出版本号时脚本会停。
 - `response.failed:<code>`：上游拒绝了这次请求。配额用尽时 code 会是类似 `insufficient_quota` 的值。
 - `response.incomplete:<reason>`：响应没完成。reason 来自上游，原样保留。
 - 只有 HTTP 状态、没有失败类别：响应里确实没有图片，也没有上面的类别。

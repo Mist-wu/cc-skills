@@ -62,6 +62,7 @@ BRANCH="pi/$NAME"
 tool_link_args() {
   local src rel dst src_phys dst_phys
   ADD_ARGS=(-- .)
+  TOOL_LINKS=()
   for src in "$MAIN_PATH/node_modules" "$MAIN_PATH"/*/node_modules; do
     [ -e "$src" ] || continue
     rel=${src#"$MAIN_PATH"/}
@@ -70,59 +71,31 @@ tool_link_args() {
     src_phys=$(phys_dir "$src") || continue
     dst_phys=$(phys_dir "$dst") || continue
     if [ "$src_phys" = "$dst_phys" ]; then
-      ADD_ARGS+=(":(exclude)$rel")
+      ADD_ARGS+=(":(exclude,literal)$rel")
+      TOOL_LINKS+=(":(literal)$rel")
     fi
   done
 }
 
-WT_PATHS=()
-WT_HEADS=()
-WT_BRANCHES=()
-
 load_worktrees() {
-  local token path head branch raw
+  local token raw
   WT_PATHS=()
-  WT_HEADS=()
   WT_BRANCHES=()
-  path=""
-  head=""
-  branch=""
   raw=$(mktemp) || die "cannot create a temp file"
   git worktree list --porcelain -z >"$raw" || { rm -f "$raw"; die "cannot list worktrees"; }
   while IFS= read -r -d '' token; do
     case "$token" in
-      worktree\ *)
-        if [ -n "$path" ]; then
-          WT_PATHS+=("$path")
-          WT_HEADS+=("$head")
-          WT_BRANCHES+=("$branch")
-        fi
-        path=${token#worktree }
-        head=""
-        branch=""
-        ;;
-      HEAD\ *) head=${token#HEAD } ;;
-      branch\ *) branch=${token#branch } ;;
-      detached) branch="" ;;
+      worktree\ *) WT_PATHS+=("${token#worktree }"); WT_BRANCHES+=("") ;;
+      branch\ *) WT_BRANCHES[${#WT_PATHS[@]}-1]=${token#branch } ;;
     esac
   done <"$raw"
   rm -f "$raw"
-  if [ -n "$path" ]; then
-    WT_PATHS+=("$path")
-    WT_HEADS+=("$head")
-    WT_BRANCHES+=("$branch")
-  fi
   [ "${#WT_PATHS[@]}" -gt 0 ] || die "this repository has no worktree"
-}
-
-same_dir() {
-  [ "$(phys_dir "$1")" = "$(phys_dir "$2")" ]
 }
 
 resolve_main() {
   load_worktrees
   MAIN_PATH=$(phys_dir "${WT_PATHS[0]}") || die "cannot resolve the main worktree"
-  MAIN_HEAD=${WT_HEADS[0]}
   local main_common
   main_common=$(git -C "$MAIN_PATH" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
     || die "cannot read the main repository"
@@ -130,22 +103,21 @@ resolve_main() {
   [ "$main_common" = "$COMMON" ] || die "worktree list does not belong to this repository"
 }
 
-# Sets TARGET_PATH, TARGET_HEAD. Refuses the wrong repo, the main worktree, and a
+# Sets TARGET_PATH. Refuses the wrong repo, the main worktree, and a
 # worktree that is not currently on pi/<name>. --force does not bypass this.
 resolve_target() {
   resolve_main
-  local i found=0 path branch common_target current
+  local i found=0 path common_target current
   for i in "${!WT_PATHS[@]}"; do
     [ "${WT_BRANCHES[$i]}" = "refs/heads/$BRANCH" ] || continue
     found=$((found + 1))
     path=${WT_PATHS[$i]}
-    TARGET_HEAD=${WT_HEADS[$i]}
   done
   [ "$found" -ne 0 ] || die "no worktree on branch $BRANCH is registered in this repository"
   [ "$found" -eq 1 ] || die "more than one worktree is registered on $BRANCH"
   [ -d "$path" ] || die "registered worktree is missing on disk: $path"
   TARGET_PATH=$(phys_dir "$path") || die "cannot resolve $path"
-  same_dir "$TARGET_PATH" "$MAIN_PATH" \
+  [ "$TARGET_PATH" = "$MAIN_PATH" ] \
     && die "refusing: $BRANCH is checked out as the main worktree, so source and target are the same"
   common_target=$(git -C "$TARGET_PATH" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
     || die "cannot read the registered worktree"
@@ -160,103 +132,56 @@ repo_key() {
   printf '%s' "$COMMON" | git hash-object --stdin | cut -c1-16
 }
 
-index_file() {
-  git -C "$1" rev-parse --path-format=absolute --git-path index 2>/dev/null
-}
-
 require_readable() {
-  local which=$1 root idx err
-  root=$MAIN_PATH
-  [ "$which" = target ] && root=$TARGET_PATH
-  idx=$(index_file "$root") || die "cannot locate the git index of $root"
+  local root=$1 idx unmerged
+  idx=$(git -C "$root" rev-parse --path-format=absolute --git-path index) || die "cannot locate the git index of $root"
   if [ -e "$idx.lock" ]; then
     die "index.lock is present in $root; refusing so staged and untracked work cannot be missed"
   fi
-  err=$(mktemp) || die "cannot create a temp file"
-  if ! git -C "$root" status --porcelain=v1 >/dev/null 2>"$err"; then
-    die "cannot read git status in $root: $(tr '\n' ' ' <"$err")"
-  fi
-  rm -f "$err"
-  if [ -n "$(git -C "$root" ls-files -u)" ]; then
-    die "index in $root has unmerged entries; refusing"
-  fi
+  git -C "$root" status --porcelain=v1 >/dev/null || die "cannot read git status in $root"
+  unmerged=$(git -C "$root" ls-files -u) || die "cannot read the index in $root"
+  [ -z "$unmerged" ] || die "index in $root has unmerged entries; refusing"
 }
 
 # Prints paths whose index differs from HEAD and whose worktree differs from the index.
 ambiguous_paths() {
-  local cached work hashdir h p
-  cached=$(mktemp) || return 2
-  work=$(mktemp) || { rm -f "$cached"; return 2; }
-  hashdir=$(mktemp -d) || { rm -f "$cached" "$work"; return 2; }
-  tool_link_args
-  if ! git -C "$TARGET_PATH" diff --cached --name-only -z "${ADD_ARGS[@]}" >"$cached"; then
-    rm -rf "$hashdir"; rm -f "$cached" "$work"; return 2
+  local raw entry xy path
+  raw=$(mktemp) || return 2
+  if ! git -C "$TARGET_PATH" status --porcelain=v1 -z --no-renames --untracked-files=no "${ADD_ARGS[@]}" >"$raw"; then
+    rm -f "$raw"
+    return 2
   fi
-  if ! git -C "$TARGET_PATH" diff --name-only -z "${ADD_ARGS[@]}" >"$work"; then
-    rm -rf "$hashdir"; rm -f "$cached" "$work"; return 2
-  fi
-  while IFS= read -r -d '' p; do
-    [ -n "$p" ] || continue
-    h=$(printf '%s' "$p" | git hash-object --stdin) || return 2
-    : >"$hashdir/$h"
-  done <"$cached"
-  while IFS= read -r -d '' p; do
-    [ -n "$p" ] || continue
-    h=$(printf '%s' "$p" | git hash-object --stdin) || return 2
-    [ -e "$hashdir/$h" ] && printf '%s\n' "$p"
-  done <"$work"
-  rm -rf "$hashdir"
-  rm -f "$cached" "$work"
+  while IFS= read -r -d '' entry; do
+    xy=${entry:0:2}
+    path=${entry:3}
+    case "$xy" in
+      ' '*) continue ;;
+      'D ') [ -e "$TARGET_PATH/$path" ] || [ -L "$TARGET_PATH/$path" ] || continue ;;
+      *' ') continue ;;
+    esac
+    printf '  %s\n' "$path"
+  done <"$raw"
+  rm -f "$raw"
 }
 
-build_snapshot() {
-  local tmp err tree
-  tmp=$(mktemp) || return 2
-  err=$(mktemp) || { rm -f "$tmp"; return 2; }
-  if ! GIT_INDEX_FILE="$tmp" git -C "$TARGET_PATH" read-tree HEAD >"$err" 2>&1; then
-    warn "cannot read the worktree HEAD into a snapshot: $(tr '\n' ' ' <"$err")"
-    rm -f "$tmp" "$err"
-    return 2
+build_snapshot() (
+  local staged tmp
+  staged=$(git -C "$TARGET_PATH" write-tree) || return 2
+  tmp=$(mktemp -d) || return 2
+  trap 'rm -rf "$tmp"' EXIT
+  export GIT_INDEX_FILE=$tmp/index
+  git -C "$TARGET_PATH" read-tree "$staged" || return 2
+  if [ "${#TOOL_LINKS[@]}" -gt 0 ]; then
+    git -C "$TARGET_PATH" reset -q "$TARGET_HEAD" -- "${TOOL_LINKS[@]}" || return 2
   fi
-  tool_link_args
-  if ! GIT_INDEX_FILE="$tmp" git -C "$TARGET_PATH" add -A "${ADD_ARGS[@]}" >"$err" 2>&1; then
-    warn "cannot snapshot worktree files: $(tr '\n' ' ' <"$err")"
-    rm -f "$tmp" "$err"
-    return 2
-  fi
-  if ! tree=$(GIT_INDEX_FILE="$tmp" git -C "$TARGET_PATH" write-tree 2>"$err"); then
-    warn "cannot write a snapshot tree: $(tr '\n' ' ' <"$err")"
-    rm -f "$tmp" "$err"
-    return 2
-  fi
-  rm -f "$tmp" "$err"
-  printf '%s\n' "$tree"
-}
-
-tree_mode_blob() {
-  local spec mode blob
-  spec=$(git -C "$TARGET_PATH" ls-tree "$1" -- "$2" 2>/dev/null) || return 2
-  [ -n "$spec" ] || return 1
-  # 100644 blob <hash>\t<path>
-  mode=${spec%% *}
-  blob=${spec#*blob }
-  blob=${blob%%[[:space:]]*}
-  [ -n "$mode" ] && [ -n "$blob" ] || return 1
-  printf '%s %s\n' "$mode" "$blob"
-}
+  git -C "$TARGET_PATH" add -A "${ADD_ARGS[@]}" || return 2
+  git -C "$TARGET_PATH" write-tree
+)
 
 blob_bytes_match() {
-  local file=$1 repo=$2 blob=$3 tmp rc
+  local file=$1 blob=$2
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  tmp=$(mktemp) || return 2
-  if ! git -C "$repo" cat-file blob "$blob" >"$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 2
-  fi
-  cmp -s "$file" "$tmp"
-  rc=$?
-  rm -f "$tmp"
-  return "$rc"
+  git -C "$TARGET_PATH" cat-file blob "$blob" 2>/dev/null | cmp -s "$file" -
 }
 
 file_mode() {
@@ -266,96 +191,45 @@ file_mode() {
 # Refuse a path whose ancestor inside the main worktree is a symlink.
 # mkdir and mktemp would otherwise write through that link, outside the tree.
 path_stays_inside() {
-  local rel=$1 acc part parent
-  case "$rel" in
-    /*) die "refusing to write $rel outside the main worktree" ;;
+  local rel=$1 parent=$1
+  case "/$rel/" in
+    //*|*/../*) die "refusing to write $rel outside the main worktree" ;;
   esac
-  parent=$(dirname "$rel")
-  [ "$parent" = . ] && return 0
-  acc=$MAIN_PATH
-  local IFS=/
-  for part in $parent; do
-    [ -n "$part" ] && [ "$part" != . ] || continue
-    [ "$part" = .. ] && die "refusing to write $rel outside the main worktree"
-    acc=$acc/$part
-    if [ -L "$acc" ]; then
-      die "refusing to write $rel through symlink $acc"
-    fi
+  while [[ $parent == */* ]]; do
+    parent=${parent%/*}
+    [ ! -L "$MAIN_PATH/$parent" ] || die "refusing to write $rel through symlink $MAIN_PATH/$parent"
   done
-  if [ -d "$MAIN_PATH/$parent" ]; then
-    local parent_phys main_phys
-    parent_phys=$(phys_dir "$MAIN_PATH/$parent") || die "cannot resolve $parent"
-    main_phys=$(phys_dir "$MAIN_PATH") || die "cannot resolve the main worktree"
-    case "$parent_phys/" in
-      "$main_phys"/*) ;;
-      *) die "refusing to write $rel outside $MAIN_PATH" ;;
-    esac
-  fi
 }
 
-# Fill OP, PTH, MODE, BLOB from BASE..TREE. Return 2 on a read error.
+# The raw tree diff includes both blobs and modes. A rename is a delete and an add.
 collect_changes() {
-  local raw status oldp newp info mode blob
-  OP=()
-  PTH=()
-  MODE=()
-  BLOB=()
+  local raw old_mode mode old_blob blob op path
+  OP=() PTH=() MODE=() BLOB=() BASE_MODE=() BASE_BLOB=()
   raw=$(mktemp) || return 2
-  if ! git -C "$TARGET_PATH" diff-tree -r -z --name-status --find-renames "$BASE" "$TREE" >"$raw"; then
+  if ! git -C "$TARGET_PATH" diff-tree -r -z --raw --no-renames --no-abbrev "$BASE" "$TREE" >"$raw"; then
     rm -f "$raw"
     return 2
   fi
-  while IFS= read -r -d '' status; do
-    [ -n "$status" ] || continue
-    case "$status" in
-      R*|C*)
-        IFS= read -r -d '' oldp || { rm -f "$raw"; return 2; }
-        IFS= read -r -d '' newp || { rm -f "$raw"; return 2; }
-        if [ "${status#R}" != "$status" ]; then
-          OP+=("D")
-          PTH+=("$oldp")
-          MODE+=("")
-          BLOB+=("")
-        fi
-        info=$(tree_mode_blob "$TREE" "$newp") || { rm -f "$raw"; return 2; }
-        mode=${info%% *}
-        blob=${info#* }
-        OP+=("A")
-        PTH+=("$newp")
-        MODE+=("$mode")
-        BLOB+=("$blob")
-        ;;
-      D)
-        IFS= read -r -d '' newp || { rm -f "$raw"; return 2; }
-        OP+=("D")
-        PTH+=("$newp")
-        MODE+=("")
-        BLOB+=("")
-        ;;
-      *)
-        IFS= read -r -d '' newp || { rm -f "$raw"; return 2; }
-        info=$(tree_mode_blob "$TREE" "$newp") || { rm -f "$raw"; return 2; }
-        mode=${info%% *}
-        blob=${info#* }
-        OP+=("$status")
-        PTH+=("$newp")
-        MODE+=("$mode")
-        BLOB+=("$blob")
-        ;;
-    esac
+  while IFS=' ' read -r -d '' old_mode mode old_blob blob op; do
+    IFS= read -r -d '' path || { rm -f "$raw"; return 2; }
+    OP+=("$op")
+    PTH+=("$path")
+    MODE+=("$mode")
+    BLOB+=("$blob")
+    BASE_MODE+=("${old_mode#:}")
+    BASE_BLOB+=("$old_blob")
   done <"$raw"
   rm -f "$raw"
 }
 
 prepare_snapshot() {
   local amb
-  require_readable target || return 2
   if ! amb=$(ambiguous_paths); then
     die "cannot compare the worktree index with its files"
   fi
   if [ -n "$amb" ]; then
     SNAP_BLOCK="index and working tree disagree, so both copies are kept:
-$(printf '%s\n' "$amb" | sed 's/^/  /')"
+$amb"
     return 1
   fi
   MAIN_HEAD=$(git -C "$MAIN_PATH" rev-parse HEAD 2>/dev/null) || die "cannot read the main HEAD"
@@ -365,19 +239,17 @@ $(printf '%s\n' "$amb" | sed 's/^/  /')"
     return 1
   }
   TREE=$(build_snapshot) || die "cannot snapshot $BRANCH"
-  collect_changes || die "cannot list changes in $BRANCH"
-  UNIQUE_COMMITS=$(git -C "$TARGET_PATH" rev-list --count "$MAIN_HEAD..$TARGET_HEAD" 2>/dev/null) \
-    || die "cannot list commits that exist only on $BRANCH"
 }
 
 bytes_landed() {
-  local i path mode blob file base_info base_mode base_blob
+  local i path mode blob file
   [ "${#OP[@]}" -eq 0 ] && return 0
   for i in "${!OP[@]}"; do
     path=${PTH[$i]}
     mode=${MODE[$i]}
     blob=${BLOB[$i]}
     file=$MAIN_PATH/$path
+    path_stays_inside "$path"
     case "${OP[$i]}" in
       D)
         [ -e "$file" ] || [ -L "$file" ] && return 1
@@ -387,7 +259,7 @@ bytes_landed() {
           100644|100755) ;;
           *) return 1 ;;
         esac
-        blob_bytes_match "$file" "$TARGET_PATH" "$blob" || return 1
+        blob_bytes_match "$file" "$blob" || return 1
         [ "$(file_mode "$file")" = "$mode" ] || return 1
         ;;
     esac
@@ -395,13 +267,9 @@ bytes_landed() {
   return 0
 }
 
-patch_path() {
-  printf '%s/%s.patch' "$(dirname "$TARGET_PATH")" "$NAME"
-}
-
 write_patch() {
   local dest tmp dir bak
-  dest=$(patch_path)
+  dest=$(dirname "$TARGET_PATH")/$NAME.patch
   dir=$(dirname "$dest")
   mkdir -p "$dir" || die "cannot create $dir"
   tmp=$(mktemp "$dir/.pi-wt-patch.XXXXXX") || die "cannot create a patch file"
@@ -427,20 +295,6 @@ write_patch() {
   PATCH=$dest
 }
 
-index_dirty_for() {
-  local err rc
-  err=$(mktemp) || return 2
-  git -C "$MAIN_PATH" diff --cached --quiet -- "$1" 2>"$err"
-  rc=$?
-  if [ "$rc" -gt 1 ]; then
-    warn "cannot read the main index for $1: $(tr '\n' ' ' <"$err")"
-    rm -f "$err"
-    return 2
-  fi
-  rm -f "$err"
-  return "$rc"
-}
-
 link_modules() {
   local src rel dst
   for src in "$MAIN_PATH/node_modules" "$MAIN_PATH"/*/node_modules; do
@@ -453,6 +307,41 @@ link_modules() {
     printf 'pi-wt: linked %s\n' "$rel" >&2
   done
 }
+
+case "$CMD" in
+diff|land|drop)
+  FORCE=0
+  if [ "$CMD" = drop ]; then
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force|-f) FORCE=1; shift ;;
+        *) die "unknown option: $1" ;;
+      esac
+    done
+  fi
+  resolve_target
+  tool_link_args
+  require_readable "$TARGET_PATH"
+  if [ "$CMD" = land ]; then require_readable "$MAIN_PATH"; fi
+  if [ "$FORCE" -eq 0 ]; then
+    if ! prepare_snapshot; then
+      [ "$CMD" = diff ] || die "$SNAP_BLOCK"
+      warn "$SNAP_BLOCK"
+      warn "showing the index diff, the worktree diff, and untracked files separately"
+      git -C "$TARGET_PATH" diff --cached --binary "${ADD_ARGS[@]}" || exit 2
+      git -C "$TARGET_PATH" diff --binary "${ADD_ARGS[@]}" || exit 2
+      git -C "$TARGET_PATH" ls-files --others --exclude-standard -z "${ADD_ARGS[@]}" | tr '\0' '\n'
+      exit $?
+    fi
+    if [ "$CMD" = diff ]; then
+      git -C "$TARGET_PATH" diff --binary --full-index "$BASE" "$TREE"
+      exit $?
+    fi
+    collect_changes || die "cannot list changes in $BRANCH"
+  fi
+  ;;
+
+esac
 
 case "$CMD" in
 
@@ -495,31 +384,7 @@ list)
   [ "$found" -eq 1 ] || printf 'no pi worktrees for this repository\n'
   ;;
 
-diff)
-  resolve_target
-  prepare_snapshot
-  snap_rc=$?
-  if [ "$snap_rc" -eq 1 ]; then
-    warn "$SNAP_BLOCK"
-    warn "showing the index diff, the worktree diff, and untracked files separately"
-    tool_link_args
-    git -C "$TARGET_PATH" diff --cached --binary "${ADD_ARGS[@]}"
-    git -C "$TARGET_PATH" diff --binary "${ADD_ARGS[@]}"
-    git -C "$TARGET_PATH" ls-files --others --exclude-standard -z "${ADD_ARGS[@]}" \
-      | tr '\0' '\n'
-    exit 0
-  fi
-  git -C "$TARGET_PATH" diff --binary --full-index "$BASE" "$TREE"
-  ;;
-
 land)
-  resolve_target
-  require_readable main
-  prepare_snapshot
-  snap_rc=$?
-  if [ "$snap_rc" -eq 1 ]; then
-    die "$SNAP_BLOCK"
-  fi
   if [ "${#OP[@]}" -eq 0 ]; then
     printf 'pi-wt: %s changed nothing.\n' "$NAME"
     exit 0
@@ -531,41 +396,26 @@ land)
     blob=${BLOB[$i]}
     file=$MAIN_PATH/$path
     path_stays_inside "$path"
-    index_dirty_for "$path"
+    git -C "$MAIN_PATH" diff --cached --quiet -- ":(literal)$path"
     dirty=$?
-    [ "$dirty" -eq 2 ] && die "cannot read the main index; patch kept at $PATCH"
-    if [ "$dirty" -ne 0 ]; then
-      die "main index already has changes on $path; stopped before changing the index. Patch: $PATCH"
+    [ "$dirty" -le 1 ] || die "cannot read the main index; patch kept at $PATCH"
+    [ "$dirty" -eq 0 ] || die "main index already has changes on $path. Patch: $PATCH"
+    if [ "${OP[$i]}" != D ]; then
+      case "$mode" in
+        100644|100755) ;;
+        *) die "refusing to land $path (mode $mode). Patch: $PATCH" ;;
+      esac
+      if blob_bytes_match "$file" "$blob" && [ "$(file_mode "$file")" = "$mode" ]; then
+        continue
+      fi
     fi
-    case "${OP[$i]}" in
-      D)
-        if [ -e "$file" ] || [ -L "$file" ]; then
-          base_info=$(tree_mode_blob "$BASE" "$path") || base_info=""
-          base_blob=${base_info#* }
-          if [ -z "$base_blob" ] || ! blob_bytes_match "$file" "$TARGET_PATH" "$base_blob"; then
-            die "main worktree copy of $path has diverged; stopped before changing it. Patch: $PATCH"
-          fi
-        fi
-        ;;
-      *)
-        case "$mode" in
-          100644|100755) ;;
-          *) die "refusing to land $path (mode $mode). Patch: $PATCH" ;;
-        esac
-        if [ -e "$file" ] || [ -L "$file" ]; then
-          if blob_bytes_match "$file" "$TARGET_PATH" "$blob" && [ "$(file_mode "$file")" = "$mode" ]; then
-            continue
-          fi
-          base_info=$(tree_mode_blob "$BASE" "$path") || {
-            die "main worktree already has $path and it is not the worktree copy. Patch: $PATCH"
-          }
-          base_blob=${base_info#* }
-          if ! blob_bytes_match "$file" "$TARGET_PATH" "$base_blob"; then
-            die "main worktree copy of $path has diverged; stopped before changing it. Patch: $PATCH"
-          fi
-        fi
-        ;;
-    esac
+    if [ -e "$file" ] || [ -L "$file" ]; then
+      if ! blob_bytes_match "$file" "${BASE_BLOB[$i]}" || [ "$(file_mode "$file")" != "${BASE_MODE[$i]}" ]; then
+        die "main worktree copy of $path has diverged; stopped before changing it. Patch: $PATCH"
+      fi
+    elif [ "${OP[$i]}" != D ] && [ "${BASE_MODE[$i]}" != 000000 ]; then
+      die "main worktree copy of $path has been removed. Patch: $PATCH"
+    fi
   done
 
   before_tree=$(git -C "$MAIN_PATH" write-tree 2>/dev/null) \
@@ -613,7 +463,7 @@ land)
         ;;
       *)
         if [ -f "$file" ] && [ ! -L "$file" ] \
-          && blob_bytes_match "$file" "$TARGET_PATH" "$blob" \
+          && blob_bytes_match "$file" "$blob" \
           && [ "$(file_mode "$file")" = "$mode" ]; then
           continue
         fi
@@ -645,21 +495,9 @@ land)
   ;;
 
 drop)
-  FORCE=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --force|-f) FORCE=1; shift ;;
-      *) die "unknown option: $1" ;;
-    esac
-  done
-  resolve_target
-  require_readable target
   if [ "$FORCE" -eq 0 ]; then
-    prepare_snapshot
-    snap_rc=$?
-    if [ "$snap_rc" -eq 1 ]; then
-      die "$SNAP_BLOCK"
-    fi
+    UNIQUE_COMMITS=$(git -C "$TARGET_PATH" rev-list --count "$MAIN_HEAD..$TARGET_HEAD" 2>/dev/null) \
+      || die "cannot list commits that exist only on $BRANCH"
     if [ "${UNIQUE_COMMITS:-0}" -gt 0 ]; then
       die "$BRANCH has $UNIQUE_COMMITS commit(s) that are not in the main branch. Refusing to remove the worktree or delete the branch, even when the working tree matches the baseline"
     fi
@@ -667,9 +505,6 @@ drop)
       die "$NAME still has work that is not byte-for-byte in the main worktree. Land it, or drop --force to discard this worktree only"
     fi
   fi
-  same_dir "$TARGET_PATH" "$MAIN_PATH" \
-    && die "refusing to remove the main worktree"
-  tool_link_args
   ignored=$(git -C "$TARGET_PATH" ls-files -o -i --exclude-standard --directory "${ADD_ARGS[@]}")
   git -C "$MAIN_PATH" worktree remove --force "$TARGET_PATH" \
     || die "worktree remove failed"
