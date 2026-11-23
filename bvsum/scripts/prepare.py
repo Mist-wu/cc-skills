@@ -13,7 +13,6 @@ import argparse
 import fcntl
 import html
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -38,11 +37,132 @@ def log(message: str) -> None:
     print(f"[bvsum] {message}", file=sys.stderr, flush=True)
 
 
+BILIBILI_HOSTS = {
+    "b23.tv",
+    "www.b23.tv",
+    "bilibili.com",
+    "www.bilibili.com",
+    "m.bilibili.com",
+}
+BV_ERROR = "未找到有效 BV 号；请传入 Bilibili URL、b23.tv 短链或 BVxxxxxxxxxx"
+
+
 def extract_bvid(value: str) -> str:
     match = re.search(r"BV[0-9A-Za-z]{10}", value)
     if not match:
-        raise ValueError("未找到有效 BV 号；请传入 Bilibili URL 或 BVxxxxxxxxxx")
+        raise ValueError(BV_ERROR)
     return match.group(0)
+
+
+def _host(url: str) -> str:
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_VIDEO_PATH = re.compile(r"/video/(BV[0-9A-Za-z]{10})(?:/|$)")
+
+
+def bvid_from_video_url(url: str, hosts: set[str]) -> str | None:
+    """BV id from a /video/<BV> path on an allowed host. Query text is ignored."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or _host(url) not in hosts:
+        return None
+    match = _VIDEO_PATH.search(parsed.path)
+    return match.group(1) if match else None
+
+
+def canonical_urls(page: str) -> list[str]:
+    """href/content of rel=canonical and og:url only, not every BV in the page."""
+    found: list[str] = []
+    for tag in re.findall(r"<link\b[^>]*>", page, flags=re.I):
+        if not re.search(r"\brel\s*=\s*['\"]canonical['\"]", tag, flags=re.I):
+            continue
+        href = re.search(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", tag, flags=re.I)
+        if href:
+            found.append(html.unescape(href.group(1)))
+    for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.I):
+        if not re.search(r"\bproperty\s*=\s*['\"]og:url['\"]", tag, flags=re.I):
+            continue
+        content = re.search(r"\bcontent\s*=\s*['\"]([^'\"]+)['\"]", tag, flags=re.I)
+        if content:
+            found.append(html.unescape(content.group(1)))
+    return found
+
+
+def _follow_bvid(start: str, hosts: set[str]) -> tuple[str, str]:
+    opener = urllib.request.build_opener(_NoRedirect)
+    current = start
+    seen: set[str] = set()
+    for _ in range(5):
+        if current in seen:
+            break
+        seen.add(current)
+        request = urllib.request.Request(
+            current,
+            headers={"User-Agent": UA, "Referer": "https://www.bilibili.com/"},
+            method="GET",
+        )
+        try:
+            with opener.open(request, timeout=20) as response:
+                final = response.geturl()
+                head = response.read(65536)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (301, 302, 303, 307, 308):
+                raise RuntimeError(f"短链解析失败：HTTP {exc.code}") from exc
+            location = exc.headers.get("Location")
+            if not location:
+                break
+            nxt = urllib.parse.urljoin(exc.geturl() or current, location)
+            parsed = urllib.parse.urlparse(nxt)
+            # A foreign host is not followed, even when its URL contains a BV id.
+            if parsed.scheme not in ("http", "https") or _host(nxt) not in hosts:
+                break
+            found = bvid_from_video_url(nxt, hosts)
+            if found:
+                return found, nxt
+            current = nxt
+            continue
+        else:
+            if _host(final) not in hosts:
+                break
+            found = bvid_from_video_url(final, hosts)
+            if found:
+                return found, final
+            text = head.decode("utf-8", "replace")
+            for raw_url in canonical_urls(text):
+                absolute = urllib.parse.urljoin(final, raw_url)
+                found = bvid_from_video_url(absolute, hosts)
+                if found:
+                    return found, absolute
+            break
+    raise ValueError(BV_ERROR)
+
+
+def resolve_bvid(value: str, *, allowed_hosts: set[str] | None = None) -> tuple[str, str]:
+    """Return the BV id and the URL whose query may contain `p`.
+
+    A bare BV id needs no network. An http(s) URL must stay on an allowed host.
+    The id comes from the /video/<BV> path, or from rel=canonical / og:url.
+    The first BV in the HTML is not used: recommended videos often appear first.
+    """
+    raw = value.strip()
+    if re.fullmatch(r"BV[0-9A-Za-z]{10}", raw):
+        return raw, raw
+
+    hosts = set(BILIBILI_HOSTS if allowed_hosts is None else allowed_hosts)
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme in ("http", "https"):
+        if _host(raw) not in hosts:
+            raise ValueError(BV_ERROR)
+        found = bvid_from_video_url(raw, hosts)
+        if found:
+            return found, raw
+        return _follow_bvid(raw, hosts)
+    return extract_bvid(raw), raw
 
 
 def requested_page(value: str) -> int | None:
@@ -136,17 +256,21 @@ def save_official_subtitle(subtitle: dict[str, Any], prefix: Path) -> tuple[Path
 
     lines: list[str] = []
     srt: list[str] = []
-    for index, item in enumerate(body, 1):
+    cue = 1
+    for item in body:
         content = html.unescape(str(item.get("content", ""))).strip()
         if not content:
             continue
         lines.append(content)
         srt.extend([
-            str(index),
+            str(cue),
             f"{timestamp(float(item.get('from', 0)))} --> {timestamp(float(item.get('to', 0)))}",
             content,
             "",
         ])
+        cue += 1
+    if not lines:
+        raise RuntimeError("官方字幕正文为空")
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     srt_path.write_text("\n".join(srt), encoding="utf-8")
     return txt_path, srt_path
@@ -288,6 +412,96 @@ def existing_transcript(prefix: Path) -> Path | None:
     return txt if txt.exists() and txt.stat().st_size > 0 else None
 
 
+def sidecar_path(prefix: Path) -> Path:
+    return prefix.with_name(prefix.name + ".transcript.json")
+
+
+def read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def manifest_page(
+    manifest: dict[str, Any] | None,
+    bvid: str,
+    page: int,
+    cid: int | None = None,
+) -> dict[str, Any] | None:
+    if not manifest or manifest.get("bvid") != bvid:
+        return None
+    for item in manifest.get("pages") or []:
+        if not isinstance(item, dict) or _as_int(item.get("page")) != page:
+            continue
+        if cid is not None and _as_int(item.get("cid")) != cid:
+            continue
+        return item
+    return None
+
+
+def cached_transcript_fields(
+    prefix: Path,
+    *,
+    bvid: str,
+    page: int,
+    cid: int,
+    old_manifest: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Read the existing machine transcript's provenance before reusing its files."""
+    transcript = existing_transcript(prefix)
+    if transcript is None:
+        return None
+
+    side = read_json_file(sidecar_path(prefix)) or {}
+    side_bvid = str(side.get("bvid") or "")
+    side_page = _as_int(side.get("page"))
+    side_cid = _as_int(side.get("cid"))
+    if side_bvid and side_bvid != bvid:
+        raise RuntimeError(f"已有字稿属于 {side_bvid}，与当前 {bvid} 不同；未覆盖。要重转请加 --force")
+    if side_page is not None and side_page != page:
+        raise RuntimeError(f"已有字稿属于 P{side_page}，与当前 P{page} 不同；未覆盖。要重转请加 --force")
+    if side_cid is not None and side_cid != cid:
+        raise RuntimeError(f"已有字稿的 cid 是 {side_cid}，当前 cid 是 {cid}；未复用也未覆盖。要重转请加 --force")
+
+    if old_manifest and old_manifest.get("bvid") == bvid and side_cid is None:
+        for item in old_manifest.get("pages") or []:
+            if not isinstance(item, dict) or _as_int(item.get("page")) != page:
+                continue
+            old_cid = _as_int(item.get("cid"))
+            if old_cid is not None and old_cid != cid:
+                raise RuntimeError(f"清单里 P{page} 的 cid 是 {old_cid}，当前是 {cid}；未复用。要重转请加 --force")
+
+    matched = manifest_page(old_manifest, bvid, page, cid) or {}
+    # Older reuse records copied the request language and had no backend.
+    if matched.get("source") == "official-subtitle" or (
+        matched.get("source") == "existing-machine-transcript" and "backend" not in matched
+    ):
+        matched = {}
+    language = str(side.get("language") or matched.get("language") or "").strip() or "unknown"
+    backend = str(side.get("backend") or matched.get("backend") or "").strip() or "unknown"
+    srt = prefix.with_suffix(".srt")
+    info: dict[str, Any] = {
+        "source": "existing-machine-transcript",
+        "language": language,
+        "backend": backend,
+        "transcript_path": str(transcript),
+        "srt_path": str(srt) if srt.exists() else None,
+    }
+    audio = prefix.with_suffix(".m4a")
+    if audio.exists():
+        info["audio_path"] = str(audio)
+    return info
+
+
 def transcribe(wav: Path, prefix: Path, language: str, backend_request: str) -> str:
     backend = select_backend(backend_request)
     log(f"本地转录：backend={backend}, language={language}")
@@ -320,10 +534,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        bvid = extract_bvid(args.input)
+        bvid, page_source = resolve_bvid(args.input)
     except ValueError as exc:
         log(str(exc))
         return 2
+    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+        log(f"ERROR: {exc}")
+        return 1
 
     output_dir = (args.output_dir.expanduser() / bvid).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +557,9 @@ def main() -> int:
         try:
             info = fetch_info(bvid)
             all_pages = info.get("pages") or [{"cid": info.get("cid"), "page": 1, "part": info.get("title", "")}]
-            selected = requested_page(args.input)
+            selected = requested_page(page_source)
+            if selected is None:
+                selected = requested_page(args.input)
             pages = [p for p in all_pages if int(p.get("page") or 1) == selected] if selected else all_pages
             if not pages:
                 raise RuntimeError(f"链接指定的分P不存在：p={selected}")
@@ -357,30 +576,32 @@ def main() -> int:
                 "pages": [],
             }
             log(f"{manifest['title']} | UP主：{manifest['owner']} | {manifest['duration_seconds']} 秒")
-
-            if args.metadata_only:
-                for page in pages:
-                    manifest["pages"].append({
-                        "page": page.get("page", 1), "cid": page.get("cid"),
-                        "title": page.get("part", ""), "duration_seconds": page.get("duration", 0),
-                    })
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                print(manifest_path)
-                return 0
+            old_manifest = read_json_file(manifest_path)
 
             for page_index, page in enumerate(pages, 1):
                 page_number = int(page.get("page") or page_index)
                 cid = int(page.get("cid") or 0)
-                if not cid:
-                    raise RuntimeError(f"P{page_number} 缺少 cid")
-                prefix_name = bvid if len(all_pages) == 1 else f"{bvid}_p{page_number:02d}"
-                prefix = output_dir / prefix_name
                 page_result: dict[str, Any] = {
                     "page": page_number,
                     "cid": cid,
                     "title": page.get("part", ""),
                     "duration_seconds": page.get("duration", 0),
                 }
+                manifest["pages"].append(page_result)
+                if args.metadata_only:
+                    previous = manifest_page(old_manifest, bvid, page_number, cid) or {}
+                    for key in (
+                        "source", "language", "backend", "transcript_path",
+                        "srt_path", "audio_path", "audio_duration_seconds",
+                    ):
+                        if previous.get(key) not in (None, ""):
+                            page_result[key] = previous[key]
+                    continue
+
+                if not cid:
+                    raise RuntimeError(f"P{page_number} 缺少 cid")
+                prefix_name = bvid if len(all_pages) == 1 else f"{bvid}_p{page_number:02d}"
+                prefix = output_dir / prefix_name
                 log(f"处理 P{page_number}：{page_result['title']}")
 
                 player = fetch_player(bvid, cid)
@@ -404,49 +625,45 @@ def main() -> int:
                                 page_result["audio_duration_seconds"] = round(duration, 3)
                             except Exception as exc:
                                 log(f"音频下载失败（字幕已就绪，继续）：{exc}")
-                        manifest["pages"].append(page_result)
                         continue
                     except Exception as exc:
                         log(f"官方字幕不可下载，回退本地转录：{exc}")
 
-                prior = existing_transcript(prefix)
-                if prior and not args.force:
+                cached = None if args.force else cached_transcript_fields(
+                    prefix, bvid=bvid, page=page_number, cid=cid, old_manifest=old_manifest,
+                )
+                if cached:
+                    page_result.update(cached)
+                    log(f"复用已有机器字稿：{cached['transcript_path']}"
+                        f"（language={cached['language']}, backend={cached['backend']}）")
+                else:
+                    audio_path, duration = save_audio(bvid, cid, page, page_number, prefix)
+                    page_result["audio_path"] = str(audio_path)
+                    page_result["audio_duration_seconds"] = round(duration, 3)
+                    with tempfile.TemporaryDirectory(prefix=f"bvsum-{bvid}-p{page_number}-") as temp:
+                        wav_audio = Path(temp) / "audio.wav"
+                        convert_to_wav(audio_path, wav_audio)
+                        used_backend = transcribe(wav_audio, prefix, args.language, args.backend)
+
+                    transcript_path = existing_transcript(prefix)
+                    if not transcript_path:
+                        raise RuntimeError("转录进程结束但未生成 TXT")
                     page_result.update({
-                        "source": "existing-machine-transcript",
+                        "source": "machine-transcript",
+                        "backend": used_backend,
                         "language": args.language,
-                        "transcript_path": str(prior),
+                        "transcript_path": str(transcript_path),
                         "srt_path": str(prefix.with_suffix('.srt')) if prefix.with_suffix('.srt').exists() else None,
                     })
-                    audio = prefix.with_suffix(".m4a")
-                    if audio.exists():
-                        page_result["audio_path"] = str(audio)
-                    log(f"复用已有机器字稿：{prior}")
-                    manifest["pages"].append(page_result)
-                    continue
-
-                audio_path, duration = save_audio(bvid, cid, page, page_number, prefix)
-                page_result["audio_path"] = str(audio_path)
-                page_result["audio_duration_seconds"] = round(duration, 3)
-                with tempfile.TemporaryDirectory(prefix=f"bvsum-{bvid}-p{page_number}-") as temp:
-                    wav_audio = Path(temp) / "audio.wav"
-                    convert_to_wav(audio_path, wav_audio)
-                    used_backend = transcribe(wav_audio, prefix, args.language, args.backend)
-
-                transcript_path = existing_transcript(prefix)
-                if not transcript_path:
-                    raise RuntimeError("转录进程结束但未生成 TXT")
-                page_result.update({
-                    "source": "machine-transcript",
-                    "backend": used_backend,
-                    "language": args.language,
-                    "transcript_path": str(transcript_path),
-                    "srt_path": str(prefix.with_suffix('.srt')) if prefix.with_suffix('.srt').exists() else None,
-                })
-                manifest["pages"].append(page_result)
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                keys = ("page", "cid", "language", "backend", "source", "transcript_path")
+                sidecar = {"bvid": bvid, **{key: page_result[key] for key in keys}}
+                sidecar_path(prefix).write_text(json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                if not cached and page_index < len(pages):
+                    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            log(f"音频与字稿保存在 {output_dir}（重启后自动清空）")
+            if not args.metadata_only:
+                log(f"音频与字稿保存在 {output_dir}（重启后自动清空）")
             print(manifest_path)
             return 0
         except Exception as exc:

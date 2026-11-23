@@ -32,6 +32,7 @@ USAGE
 
 # ---------------------------------------------------------------- progress ---
 if [ "${1:-}" = "progress" ]; then
+  command -v jq >/dev/null || die "jq is not on PATH"
   DIR=${2:-latest}
   [ "$DIR" = "latest" ] && DIR=$(ls -dt "$RUN_ROOT"/*/ 2>/dev/null | head -1)
   [ -n "$DIR" ] && [ -d "$DIR" ] || die "no run directory found"
@@ -39,7 +40,7 @@ if [ "${1:-}" = "progress" ]; then
   printf 'run: %s\n' "$DIR"
   [ -f "$DIR/cmd.txt" ] && sed -n '1,2p' "$DIR/cmd.txt"
   if [ -f "$DIR/raw.jsonl" ]; then
-    printf 'elapsed: %ss\n' "$(( $(date +%s) - $(stat -f %B "$DIR/raw.jsonl" 2>/dev/null || echo "$(date +%s)") ))"
+    printf 'elapsed: %ss\n' "$(( $(date +%s) - $(stat -f %B "$DIR/raw.jsonl" 2>/dev/null || date +%s) ))"
     printf 'steps:\n'
     jq -Rrn '[inputs | select(startswith("{")) | (fromjson? // empty)]
             | .[] | select(.type=="tool_execution_start" or .type=="tool_execution_end")
@@ -56,29 +57,52 @@ if [ "${1:-}" = "progress" ]; then
 fi
 
 # -------------------------------------------------------------------- args ---
-PROFILE=recon MODEL=flash CWD=$PWD TIMEOUT= SESSION= THINKING=high
-EXTRA_TOOLS= LABEL= PROMPT= DRY_RUN=0 UNSAFE=0
+PROFILE=recon MODEL=flash CWD=$PWD TIMEOUT='' SESSION='' THINKING=high
+EXTRA_TOOLS='' LABEL='' PROMPT='' DRY_RUN=0 UNSAFE=0
 
+# Preserve the supplied wrapper options for resume. Pin cwd, timeout and session
+# after resolving their defaults and turning "new" into the actual session ID.
+case "$0" in /*) RESUME=("$0") ;; *) RESUME=("$PWD/$0") ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
-    --profile)        [ $# -ge 2 ] || die "--profile needs a value"; PROFILE=$2; shift 2 ;;
-    --model)          [ $# -ge 2 ] || die "--model needs a value"; MODEL=$2; shift 2 ;;
-    --cwd)            [ $# -ge 2 ] || die "--cwd needs a value"; CWD=$2; shift 2 ;;
-    --timeout)        [ $# -ge 2 ] || die "--timeout needs a value"; TIMEOUT=$2; shift 2 ;;
-    --session)        [ $# -ge 2 ] || die "--session needs a value"; SESSION=$2; shift 2 ;;
-    --thinking)       [ $# -ge 2 ] || die "--thinking needs a value"; THINKING=$2; shift 2 ;;
-    --tools)          [ $# -ge 2 ] || die "--tools needs a value"; EXTRA_TOOLS=$2; shift 2 ;;
-    --label)          [ $# -ge 2 ] || die "--label needs a value"; LABEL=$2; shift 2 ;;
-    --unsafe-in-place) UNSAFE=1; shift ;;
-    --dry-run)        DRY_RUN=1; shift ;;
-    -h|--help)        usage; exit 0 ;;
-    --)               shift; PROMPT=$*; break ;;
-    *)                die "unknown option: $1 (the prompt goes after --)" ;;
+    --unsafe-in-place) UNSAFE=1; RESUME+=("$1"); shift; continue ;;
+    --dry-run) DRY_RUN=1; shift; continue ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; PROMPT=$*; break ;;
   esac
+  [ $# -ge 2 ] || die "$1 needs a value"
+  case "$1" in
+    --cwd)     CWD=$2; shift 2; continue ;;
+    --session) SESSION=$2; shift 2; continue ;;
+    --timeout) [ -n "$2" ] || die "--timeout needs a non-empty integer"
+               TIMEOUT=$2; shift 2; continue ;;
+    --profile) PROFILE=$2 ;;
+    --model) MODEL=$2 ;;
+    --thinking) THINKING=$2 ;;
+    --tools) EXTRA_TOOLS=$2 ;;
+    --label) LABEL=$2 ;;
+    *) die "unknown option: $1 (the prompt goes after --)" ;;
+  esac
+  RESUME+=("$1" "$2")
+  shift 2
 done
 
 [ -n "$PROMPT" ] || { usage >&2; die "no prompt (put it after --)"; }
 [ -d "$CWD" ] || die "--cwd is not a directory: $CWD"
+case "$CWD" in /*) ;; *) CWD=$PWD/$CWD ;; esac
+if [ -n "$LABEL" ]; then
+  case "$LABEL" in
+    *[!A-Za-z0-9._-]*) die "--label may only contain letters, digits, dot, dash, underscore" ;;
+  esac
+fi
+if [ -n "$TIMEOUT" ]; then
+  case "$TIMEOUT" in
+    *[!0-9]*) die "--timeout must be a positive integer" ;;
+  esac
+  # 10# so 08 is eight seconds, not an invalid octal number.
+  TIMEOUT=$((10#$TIMEOUT))
+  [ "$TIMEOUT" -gt 0 ] || die "--timeout must be a positive integer"
+fi
 command -v pi >/dev/null || die "pi is not on PATH"
 command -v jq >/dev/null || die "jq is not on PATH"
 
@@ -164,9 +188,9 @@ End your final message with exactly this block, in the language of the task:
 # --------------------------------------------------------------------- run ---
 STAMP=$(date +%Y%m%d-%H%M%S)
 SLUG=$PROFILE${LABEL:+-$LABEL}
-LOG=$RUN_ROOT/$STAMP-$SLUG
-[ -e "$LOG" ] && LOG=$LOG-$$
-mkdir -p "$LOG" || die "cannot create log dir $LOG"
+mkdir -p "$RUN_ROOT" || die "cannot create $RUN_ROOT"
+# mktemp is atomic: concurrent runs with the same label each get a directory.
+LOG=$(mktemp -d "$RUN_ROOT/${STAMP}-${SLUG}.XXXXXX") || die "cannot create log dir"
 RAW=$LOG/raw.jsonl
 
 CMD=(pi -p --mode json --provider "$PROVIDER" --model "$MODEL_ID" -t "$TOOLS" --thinking "$THINKING" --append-system-prompt "$SYS")
@@ -185,18 +209,104 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+command -v perl >/dev/null || die "perl is not on PATH (the watchdog has to be one process, not a bash sleep)"
+
 START=$(date +%s)
-( cd "$CWD" && "${CMD[@]}" ) >"$RAW" 2>"$LOG/stderr.log" &
+# setsid + exec: PI_PID is the real pi process and the leader of its group.
+# Killing the group delivers TERM to pi and to children that did not detach.
+perl -e '
+  use POSIX qw(setsid);
+  my $dir = shift @ARGV;
+  chdir $dir or die "chdir: $!\n";
+  setsid() or die "setsid: $!\n";
+  open STDIN, "<", "/dev/null" or die "stdin: $!\n";
+  exec @ARGV or die "exec: $!\n";
+' "$CWD" "${CMD[@]}" >"$RAW" 2>"$LOG/stderr.log" &
 PI_PID=$!
-( sleep "$TIMEOUT"; kill -TERM "$PI_PID" 2>/dev/null; sleep 10; kill -KILL "$PI_PID" 2>/dev/null ) >/dev/null 2>&1 &
+
+# One perl process. Bash 3.2 does not deliver TERM to a background `sleep`,
+# so a shell watchdog would keep running after this script returns.
+perl -e '
+  use strict;
+  use warnings;
+  my ($timeout, $pid, $flag, $grace) = @ARGV;
+  $timeout = int($timeout);
+  $pid = int($pid);
+  $grace = int($grace);
+  $SIG{TERM} = sub { exit 0 };
+  $SIG{INT}  = sub { exit 0 };
+  $SIG{HUP}  = sub { exit 0 };
+  sub group_alive {
+    return 1 if kill 0, -$pid;
+    return 1 if kill 0, $pid;
+    return 0;
+  }
+  my $end = time() + $timeout;
+  while (time() < $end) {
+    my $slice = $end - time();
+    last if $slice <= 0;
+    $slice = 0.2 if $slice > 0.2;
+    select(undef, undef, undef, $slice);
+  }
+  exit 0 unless group_alive();
+  open(my $fh, ">", $flag) or exit 0;
+  print $fh "fired\n";
+  close $fh;
+  kill "TERM", -$pid;
+  kill "TERM", $pid;
+  $end = time() + $grace;
+  while (time() < $end) {
+    exit 0 unless group_alive();
+    select(undef, undef, undef, 0.2);
+  }
+  if (group_alive()) {
+    kill "KILL", -$pid;
+    kill "KILL", $pid;
+  }
+' "$TIMEOUT" "$PI_PID" "$LOG/watchdog-fired" 10 >>"$LOG/watchdog.log" 2>&1 &
 WD_PID=$!
-RC=0; wait "$PI_PID" || RC=$?
-kill "$WD_PID" 2>/dev/null; wait "$WD_PID" 2>/dev/null
+printf '%s\n' "$WD_PID" >"$LOG/watchdog.pid"
+printf '%s\n' "$PI_PID" >"$LOG/pi.pid"
+
+stop_watchdog() {
+  if [ -n "${WD_PID:-}" ]; then
+    kill -TERM "$WD_PID" 2>/dev/null || true
+    wait "$WD_PID" 2>/dev/null || true
+    WD_PID=
+  fi
+}
+
+reap_group() {
+  [ -n "${PI_PID:-}" ] || return 0
+  if kill -0 -- -"$PI_PID" 2>/dev/null || kill -0 "$PI_PID" 2>/dev/null; then
+    kill -TERM -- -"$PI_PID" 2>/dev/null || kill -TERM "$PI_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL -- -"$PI_PID" 2>/dev/null || kill -KILL "$PI_PID" 2>/dev/null || true
+  fi
+  wait "$PI_PID" 2>/dev/null || true
+}
+
+on_stop() {
+  stop_watchdog
+  reap_group
+  exit "$1"
+}
+trap 'on_stop 130' INT
+trap 'on_stop 143' TERM
+trap 'on_stop 129' HUP
+
+RC=0
+wait "$PI_PID" || RC=$?
+trap - INT TERM HUP
+stop_watchdog
+reap_group
 ELAPSED=$(( $(date +%s) - START ))
 
 TIMED_OUT=0
-if [ "$RC" -eq 143 ] || [ "$RC" -eq 137 ] || { [ "$RC" -ne 0 ] && [ "$ELAPSED" -ge "$TIMEOUT" ]; }; then
-  TIMED_OUT=1; RC=124
+# Only the watchdog flag means a timeout. An external TERM is a normal signal exit.
+if [ -s "$LOG/watchdog-fired" ]; then
+  TIMED_OUT=1
+  RC=124
 fi
 
 # ----------------------------------------------------------------- extract ---
@@ -205,15 +315,13 @@ STATS=$(jq -Rrn '
   | ($e | map(select(.type=="message_end" and .message.role=="assistant"))) as $am
   | {
       cost:   ([$am[] | .message.usage.cost.total // 0] | add // 0),
-      tin:    ([$am[] | .message.usage.input      // 0] | add // 0),
-      tout:   ([$am[] | .message.usage.output     // 0] | add // 0),
       tools:  ([$e[]  | select(.type=="tool_execution_end")] | length),
       terr:   ([$e[]  | select(.type=="tool_execution_end" and .isError==true)] | length),
       stop:   ($am | last | .message.stopReason // "none"),
       recent: ([$e[]  | select(.type=="tool_execution_end") | .toolName] | .[-3:] | join(" ")),
       think:  ([$am[] | .message.content[]? | select(.type=="thinking") | .thinking] | last // "")
     }' "$RAW" 2>/dev/null)
-[ -n "$STATS" ] || STATS='{"cost":0,"tin":0,"tout":0,"tools":0,"terr":0,"stop":"none","recent":"","think":""}'
+[ -n "$STATS" ] || STATS='{"cost":0,"tools":0,"terr":0,"stop":"none","recent":"","think":""}'
 stat_of() { printf '%s' "$STATS" | jq -r ".$1 // empty"; }
 
 FINAL=$(jq -Rrn '
@@ -236,10 +344,14 @@ TOOL_TXT="$TOOLS_N tools"
 
 printf '\n-- pi | %s | %s | %ss | %s | %s | %s\n' \
   "$MODEL_ID" "$PROFILE" "$ELAPSED" "$COST" "$TOOL_TXT" "$LOG"
+printf '   cost sums assistant usage.cost.total in this run log; it is not an account bill\n'
 
 if [ -n "$SID" ]; then
-  printf '   session %s -- follow up: pi-run.sh --profile %s --model %s --cwd %s --session %s -- "..."\n' \
-    "$SID" "$PROFILE" "$MODEL" "$CWD" "$SID"
+  RESUME+=(--cwd "$CWD" --timeout "$TIMEOUT" --session "$SID" -- "...")
+  printf '   session %s -- follow up:\n' "$SID"
+  printf '   resume:'
+  printf ' %q' "${RESUME[@]}"
+  printf '\n'
 fi
 
 if [ "$TIMED_OUT" -eq 1 ]; then

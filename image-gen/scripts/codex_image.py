@@ -2,8 +2,8 @@
 """用本机 Codex OAuth 会话生图，可传入图片做改图或参考。
 
 外层对话模型默认 gpt-6-luna，生图工具默认 gpt-image-2.5。
-请求身份对齐本机 Codex TUI（originator=codex-tui，CLI 0.158.0）。
-旧的 codex_cli_rs/0.125.0 会被 ChatGPT 账号拒绝 gpt-6-luna。
+请求身份对齐本机 Codex TUI（originator=codex-tui）。
+版本号读 `codex --version`。解析失败就停止，不用旧版本号冒充。
 访问令牌运行时向 pi 读取，不写入本文件。
 """
 
@@ -53,12 +53,24 @@ def chatgpt_account_id() -> str:
     return account_id
 
 
+def parse_codex_version(raw: str) -> str:
+    text = raw.strip()
+    token = text.split()[-1] if text else ""
+    if not token or not token[0].isdigit():
+        raise SystemExit(f"无法解析 codex --version 的输出：{raw!r}")
+    return token
+
+
 def codex_cli_version() -> str:
-    raw = subprocess.check_output(["codex", "--version"], text=True, stderr=subprocess.DEVNULL).strip()
-    version = raw.split()[-1]
-    if not version or not version[0].isdigit():
-        return "0.158.0"
-    return version
+    try:
+        raw = subprocess.check_output(
+            ["codex", "--version"], text=True, stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit("找不到 codex CLI，无法拼请求头。安装后重试。") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"codex --version 失败（退出码 {exc.returncode}）") from exc
+    return parse_codex_version(raw)
 
 
 def codex_user_agent(version: str) -> str:
@@ -172,14 +184,38 @@ def take_image(item: dict, current: str | None) -> str | None:
     return current
 
 
+def _event_error(event: dict) -> str | None:
+    """Upstream failure category. Empty when this event is not a failure."""
+    kind = str(event.get("type") or "")
+    if kind == "response.failed":
+        response = event.get("response") or {}
+        err = response.get("error") if isinstance(response, dict) else None
+        if not isinstance(err, dict):
+            err = event.get("error") if isinstance(event.get("error"), dict) else {}
+        code = str(err.get("code") or err.get("type") or "failed")
+        message = str(err.get("message") or "").strip()
+        text = f"response.failed:{code}"
+        return f"{text}: {message}" if message else text
+    if kind == "response.incomplete":
+        response = event.get("response") or {}
+        details = response.get("incomplete_details") if isinstance(response, dict) else None
+        reason = "incomplete"
+        if isinstance(details, dict) and details.get("reason"):
+            reason = str(details["reason"])
+        return f"response.incomplete:{reason}"
+    if kind == "error" or (kind != "response.completed" and event.get("error")):
+        body = event.get("error") or event
+        return "error: " + json.dumps(body, ensure_ascii=False)
+    return None
+
+
 def parse_response(text: str) -> tuple[str | None, dict | None, str | None]:
     image_b64 = None
     usage = None
     error = None
     for event in iter_sse(text):
         kind = event.get("type")
-        if kind == "error" or (kind != "response.completed" and event.get("error")):
-            error = json.dumps(event.get("error") or event, ensure_ascii=False)
+        error = error or _event_error(event)
         if kind == "response.output_item.done":
             image_b64 = take_image(event.get("item") or {}, image_b64)
         if kind == "response.completed":
@@ -187,6 +223,9 @@ def parse_response(text: str) -> tuple[str | None, dict | None, str | None]:
             usage = response.get("usage") or usage
             for item in response.get("output") or []:
                 image_b64 = take_image(item, image_b64)
+            status = response.get("status")
+            if not image_b64 and not error and status in ("failed", "incomplete"):
+                error = _event_error({"type": f"response.{status}", "response": response})
     return image_b64, usage, error
 
 
@@ -234,7 +273,7 @@ def main() -> None:
     if error and not image_b64:
         raise SystemExit(error)
     if not image_b64:
-        raise SystemExit(f"HTTP {status}，上游没有返回图片")
+        raise SystemExit(f"HTTP {status}，上游没有返回图片，响应里也没有失败类别")
 
     image = base64.b64decode(image_b64)
     output = Path(args.output)
