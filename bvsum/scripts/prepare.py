@@ -175,8 +175,36 @@ def requested_page(value: str) -> int | None:
         return None
 
 
+_buvid_cookie: str | None = None
+
+
+def buvid_cookie() -> str:
+    """游客身份 cookie。没有 buvid3 时 view 等接口会直接返回 412。取不到就返回空串，不影响后续流程。"""
+    global _buvid_cookie
+    if _buvid_cookie is None:
+        _buvid_cookie = ""
+        try:
+            req = urllib.request.Request(
+                f"{API}/x/frontend/finger/spi",
+                headers={"User-Agent": UA, "Referer": "https://www.bilibili.com/"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8")).get("data") or {}
+            if data.get("b_3"):
+                parts = [f"buvid3={data['b_3']}", f"b_nut={int(time.time())}"]
+                if data.get("b_4"):
+                    parts.append(f"buvid4={urllib.parse.quote(data['b_4'], safe='')}")
+                _buvid_cookie = "; ".join(parts)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            log(f"获取 buvid3 失败，继续不带 cookie 请求：{exc}")
+    return _buvid_cookie
+
+
 def request_bytes(url: str, *, referer: str = "https://www.bilibili.com/", retries: int = 3) -> bytes:
     headers = {"User-Agent": UA, "Referer": referer, "Accept": "*/*"}
+    host = _host(url)
+    if (host == "bilibili.com" or host.endswith(".bilibili.com")) and (cookie := buvid_cookie()):
+        headers["Cookie"] = cookie
     last_error: Exception | None = None
     for attempt in range(retries):
         try:
