@@ -48,25 +48,23 @@ Exit codes: `0` ok, `1` pi failed, `2` bad usage, `124` timed out.
 | `recon` | `read,grep,find,ls` | off | no |
 | `test` | `bash,read,grep,find,ls` | on | no edit tool, on purpose |
 | `edit` | `read,write,edit,bash,grep,find,ls` | on | yes, worktree only |
-| `browser` | all `chrome_devtools_*`, `web_search`, `read` | on | drives real Chrome |
+| `browser` | 14 core `chrome_devtools_*` names, `web_search`, `read` | on | drives real Chrome |
 | `free` | whatever `--tools` says | off | depends |
 
-`pi`'s `grep`, `find` and `ls` are off unless whitelisted, and `-t` does **not** take globs -
-every tool name must be spelled out.
+`pi`'s `grep`, `find` and `ls` are off unless whitelisted. `-t` takes exact names and `*`
+patterns. The browser profile still spells out the core `chrome_devtools_*` names so it
+does not also enable `chrome_devtools_webmcp_*`: `webmcp_call_tool` does not run under `pi -p`.
 
 ## Which model
 
-Only two, and the gap between them is enormous - roughly 30-40x in price per token and 10x in
-latency. Prices, context sizes and timings live in `reference/models.md`.
+Prices, context sizes, and the thinking-level map live in `reference/models.md`.
 
 **`flash`** (`deepseek/deepseek-flash`) is the default and handles most delegation: web search,
 reading and summarising code, mechanical multi-file edits, running builds, drafting boilerplate.
-Measured: 4s for a web search, 11s and half a cent for a 16-tool code recon.
 
 **`astra`** (`openai-codex/gpt-6-astra`) is for work where being wrong is expensive: a bug that
 survived one flash attempt, an architecture judgement, a subtle race, anything you would not
-trust yourself to one-shot. It thinks slowly - 7s minimum, minutes on real tasks - so give it
-room and expect a much larger bill.
+trust yourself to one-shot. It thinks slowly, so give it room and expect a much larger bill.
 
 Escalate on evidence, not on vibes: run flash first, and reach for astra when its answer is
 visibly thin, wrong, or it gives up.
@@ -78,9 +76,13 @@ astra will run past a default timeout on a real task. Two habits:
 - Raise `--timeout` deliberately (1800-3000s for anything meaty). The budget is written into
   the subagent's prompt, so it knows to wrap up rather than get killed mid-thought.
 - Keep the session (default for `test`/`edit`/`browser`; pass `--session new` for `recon`).
-  A killed run is resumable: the footer prints the exact resume command, and the subagent keeps
-  everything it had read. **A resume replays the whole context, so on astra it costs real money**
-  - resuming is for salvaging work, not for chatting.
+  A killed run is resumable: the footer prints a `resume:` command with the script path,
+  profile, model, cwd, timeout, thinking, session, and `--tools` when the profile needs them.
+  Paths are shell-quoted. Run that command as-is. **A resume replays the whole context, so on
+  astra it costs real money** - resuming is for salvaging work, not for chatting.
+- Exit `124` means the watchdog fired: it sent `TERM` to the pi process group, then `KILL`
+  after 10 seconds if the group was still alive. An external `TERM`, or you interrupting the
+  wrapper, is not reported as a timeout. The wrapper reaps that process group before it returns.
 
 While one runs, watch it:
 
@@ -91,12 +93,13 @@ While one runs, watch it:
 ## Parallel
 
 Nothing in the scripts serialises anything. Run several read-only probes at once with the Bash
-tool's `run_in_background`, each with its own `--label`, then collect. Three flash recons cost
-about as much as one thought. Do not fan out `edit` jobs into the same worktree.
+tool's `run_in_background`, each with its own `--label`, then collect. Do not fan out `edit`
+jobs into the same worktree.
 
 ## Writing code
 
-`edit` refuses to run outside a `pi/*` branch - it wants an isolated worktree:
+`edit` only checks that the branch name starts with `pi/`. A main worktree checked out on
+`pi/something` passes that check. Use `pi-wt.sh` when you actually want a linked worktree:
 
 ```bash
 WT=$(~/.claude/skills/pi-agent/scripts/pi-wt.sh new fix-timeout)   # prints the path
@@ -106,13 +109,42 @@ WT=$(~/.claude/skills/pi-agent/scripts/pi-wt.sh new fix-timeout)   # prints the 
 ~/.claude/skills/pi-agent/scripts/pi-wt.sh drop fix-timeout
 ```
 
-The worktree sits in `~/.claude/pi-worktrees/<repo>/<name>`, outside the repo. `new` symlinks
-the root and workspace `node_modules` in so builds and tests actually run there; those symlinks
-are excluded from every diff. `land` applies the diff to the main worktree **unstaged and
-uncommitted** - the user decides what gets committed, always. `drop` refuses to discard unlanded
-work unless forced.
+`new` registers the worktree with git and puts it under `~/.claude/pi-worktrees/<repo-key>/<name>`.
+The key is the repository id, not the directory's basename, so two repos with the same folder
+name do not share a worktree. `new` symlinks the root and workspace `node_modules` in so builds
+and tests actually run there. Only those exact symlinks are left out of the diff. A real
+`node_modules` directory is not a dependency link: untracked files in it are kept.
 
-`git apply` is not atomic: if `land` fails partway it says so, and the tree needs a look.
+`land` copies the worktree's committed, staged, unstaged, and untracked bytes into the main
+**working tree** and does not stage them. It will not create or replace a file by following a
+symlink ancestor, so a link inside the main tree cannot redirect the write. It compares whole files. A repeated hunk elsewhere in
+the file cannot satisfy the check. If the main index already has changes on a path being
+landed, or the main file has diverged so the result would not stay an exact unstaged copy,
+`land` stops before it changes the index and keeps the patch. Overlapping edits are not
+auto-merged. An empty `land` does not delete an existing patch. A newer patch renames the
+previous one to `*.patch.bak.<time>` instead of overwriting it.
+
+`drop` without `--force` removes the worktree only when all of these hold:
+
+- git has this worktree registered on branch `pi/<name>` in **this** repository
+- that path is not the main worktree
+- the index and the working tree do not disagree
+- status and the index can be read (`index.lock` keeps the worktree)
+- the branch has no commits that the main branch does not already have. A commit that
+  exists only on `pi/<name>` keeps both the worktree and the branch, even when the files on
+  disk have been put back to the baseline. Ordinary `drop` does not run `branch -D` for it
+- every changed path is already byte-for-byte in the main working tree, including untracked
+  files inside a real `node_modules` directory
+
+It refuses a different repository, a branch that is no longer `pi/<name>`, edits made on either
+side after `land`, and a main file that only happens to contain the same hunk somewhere else.
+`--force` still requires the same identity and a readable worktree. It discards commits, the
+index, and untracked files in that worktree only. It does not change the main index or the main
+working tree, and it does not remove a worktree that has been switched to another branch.
+
+Removing the directory also deletes gitignored files that live only there, including files you
+created. Those files are not copied to the main worktree. `node_modules` symlinks created by
+`new` are removed; their targets stay. `drop` does not delete the recovery patch.
 
 ## Reading the result
 
@@ -128,7 +160,12 @@ Then the footer:
 
 ```
 -- pi | deepseek-flash | recon | 11s | $0.0054 | 16 tools | ~/.claude/pi-runs/<run>
+   cost sums assistant usage.cost.total in this run log; it is not an account bill
 ```
+
+`$0.0054` is the sum of `message.usage.cost.total` on assistant messages in this run's
+`raw.jsonl`. Pi's own session total can also include tool and compaction usage. A resume is a
+new run with its own sum. Two assistant messages of `0.20` and `0.30` print `$0.5000`.
 
 Read `UNFINISHED` before `RESULT` - it is where the subagent admits what it guessed.
 

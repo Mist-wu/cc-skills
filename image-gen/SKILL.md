@@ -31,10 +31,16 @@ python3 ~/.claude/skills/image-gen/scripts/codex_image.py '<提示词>' -o <输�
 
 用 Read 打开生成的 PNG 自己看一眼，确认内容符合要求（主体对、没有明显崩坏、文字没拼错）。不符合就调整提示词重试一次，再告诉用户。
 
-最后告诉用户文件路径，用 SendUserFile 把图片发给用户。
+最后把 PNG 的绝对路径告诉用户。这一步就完成了交付。只有当前会话里真有 SendUserFile 时才再发文件。官方把它限定在已连接的 Remote Control 客户端或云会话。普通本地会话没有这个工具。
 
 ## 失败处理
 
+脚本退出时会带上上游的失败类别。把这一行原样告诉用户。不要把“没有图片”理解成内容被拒，也不要据此默认改提示词。
+
 - `pi auth 失败` / 401：Codex 登录过期，让用户在终端运行 `pi` 重新登录 openai-codex。
-- 上游 HTTP 4xx 提到模型不可用：把原始报错告诉用户，可以用 `--outer-model` / `--image-model` 换模型再试。请求头要对齐本机 `codex --version`，旧版本号会被拒。
-- 上游没有返回图片：通常是内容被拒，改写提示词后重试。
+- 上游 HTTP 4xx 提到模型不可用：把原始报错告诉用户，可以用 `--outer-model` / `--image-model` 换模型再试。请求头用本机 `codex --version`。解析不出版本号时脚本会停，不会改用 `0.158.0`。
+- `response.failed:<code>`：上游拒绝了这次请求。配额用尽时 code 会是类似 `insufficient_quota` 的值。
+- `response.incomplete:<reason>`：响应没完成。reason 来自上游，原样保留。
+- 只有 HTTP 状态、没有失败类别：响应里确实没有图片，也没有上面的类别。
+
+外层默认模型 `gpt-6-luna` 在本机 pi 目录里。`gpt-image-2.5`、私有端点和当前账号能不能真正出图，没有用实单验证过。

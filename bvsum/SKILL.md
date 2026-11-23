@@ -1,6 +1,6 @@
 ---
 name: bvsum
-description: 总结哔哩哔哩视频。用户给出 B站链接（bilibili.com / b23.tv）或 BV号并想知道视频讲了什么、要总结或要字稿时使用。下载音频，取官方字幕或本地 Whisper 转录，必要时联网补充，然后自由组织总结。
+description: 总结哔哩哔哩视频。用户给出 B 站链接（bilibili.com / b23.tv）或 BV 号并想知道视频讲了什么、要总结或要字稿时使用。下载音频，取官方字幕或本地 Whisper 转录，必要时联网补充，然后自由组织总结。
 allowed-tools: Bash, Read, WebSearch, WebFetch
 ---
 
@@ -12,7 +12,11 @@ allowed-tools: Bash, Read, WebSearch, WebFetch
 python3 ~/.claude/skills/bvsum/scripts/prepare.py '<B站链接或BV号>'
 ```
 
-脚本下载音频（m4a），优先取 B站官方字幕，没有字幕就用本地 Whisper 转录。所有文件放在 `/tmp/bvsum/<BV号>/`，重启后自动清空。最后一行输出 `.bvsum.json` manifest 路径，里面有 `pubdate`、简介，每个分 P 有 `transcript_path`、`srt_path`、`audio_path`、`source`、`chapters`。
+脚本下载音频（m4a），优先取 B 站官方字幕，没有字幕就用本地 Whisper 转录。裸 BV 号和 `b23.tv` 短链可以直接传。短链只跟随仍在 B 站域名上的跳转，再从 `/video/<BV>` 路径或页面的 canonical / og:url 取 BV。页面里靠前的推荐视频不会被当成目标。所有文件放在 `/tmp/bvsum/<BV号>/`，重启后自动清空。最后一行输出 `.bvsum.json` manifest 路径，里面有 `pubdate`、简介，每个分 P 有 `transcript_path`、`srt_path`、`audio_path`、`source`、`chapters`。
+
+已有机器字稿按 BV、分 P、cid 和旁边的 `.transcript.json` 对上来源。语言和 backend 沿用当时的记录。旧缓存没有这些记录时写成 `unknown`，不会改成这次的 `--language`。cid 变了就不复用，也不覆盖，除非加 `--force`。`--metadata-only` 只补元数据，不改已有字稿的来源。
+
+本机 `/usr/bin/python3` 3.9.6 跑过 `--help`、短链和这份缓存逻辑。脚本用了 `from __future__ import annotations` 和 `Path.unlink(missing_ok=True)`（3.8 起就有）。
 
 把字稿完整读完再动笔。长视频转录要几分钟，用 `run_in_background` 跑，等完成通知。
 
@@ -20,7 +24,6 @@ python3 ~/.claude/skills/bvsum/scripts/prepare.py '<B站链接或BV号>'
 
 - 字稿乱码、语言识别错误或大段重复：`--force --language zh`（或 `en`）重转。
 - 长视频后半段明显漂移：用 ffmpeg 把 m4a 切成 10–20 分钟的段分别转录。
-- `b23.tv` 短链先用 `curl -sIL` 取到跳转后的地址。
 - 只要字稿不要音频：`--no-audio`（仅在有官方字幕时生效）。
 
 ## 2. 联网补充
@@ -34,7 +37,7 @@ python3 ~/.claude/skills/bvsum/scripts/prepare.py '<B站链接或BV号>'
 只有几条底线：
 
 - 依据字稿的真实内容，不能只凭标题和简介。重要的例子、数据、转折、不同人的分歧要留下来。
-- 交代材料来源：B站官方字幕（含 AI 字幕 `ai-zh`）还是本地机器转录，不能把机器转录说成官方字幕。机器转录里听不清、可能识别错的专有名词，要标出来或联网确认。
+- 交代材料来源：B 站官方字幕（含 AI 字幕 `ai-zh`）还是本地机器转录，不能把机器转录说成官方字幕。机器转录里听不清、可能识别错的专有名词，要标出来或联网确认。
 - 结尾给出 `/tmp/bvsum/<BV号>/` 路径，说明重启后会清空。
 
 ## 遇到问题
